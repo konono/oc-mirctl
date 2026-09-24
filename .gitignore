@@ -1,0 +1,8 @@
+bin/
+/oc-mirctl
+mirror_data/
+.tracecraft/
+.image-size-cache.json
+mise.toml
+.envrc
+.kube/
