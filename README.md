@@ -21,9 +21,32 @@ make cross
 # → bin/oc-mirctl-darwin-arm64
 ```
 
-## Usage
+## データディレクトリ構造
 
-データはすべて `mirror_data/<cluster-name>/` に保存される（固定パス、`--output-dir` は不要）。
+すべてのデータは `mirror_data/` 配下にクラスタ名のサブディレクトリとして保存される。
+ベースディレクトリ名は `mirror_data` で固定されており、`--output-dir` のようなオプションは存在しない。
+
+```
+mirror_data/                          # 固定ベースディレクトリ (変更不可)
+  └─ <cluster-name>/                  # collect 時にクラスタ名で自動作成
+      ├── collected-data.json         # 収集データ (collect が生成・更新)
+      ├── exclusions.json             # 除外リスト (exclude/include が管理)
+      ├── imageset-config.yaml        # ImageSetConfiguration (generate が生成)
+      ├── disconnected-overrides.yaml # disconnected 設定 (generate が生成)
+      ├── pull-secret.json            # Pull secret (collect が保存)
+      ├── .image-size-cache.json      # サイズキャッシュ (自動管理)
+      └── backups/                    # collect 時の差分バックアップ
+          └── YYYYMMDD-HHMMSS/
+              └── collected-data.json # 前回の collected-data.json
+```
+
+**設計方針**:
+- ベースディレクトリを固定することで `--output-dir` の指定ミスによるデータの散逸を防ぐ
+- クラスタ名のサブディレクトリにより、複数クラスタのデータを共存可能（ただし1クラスタのみの場合は自動検出）
+- `collect` を再実行すると前回データとマージされ、差分がある場合のみ `backups/` にバックアップを作成
+- `exclusions.json` は `collect` では上書きされない（exclude/include コマンドでのみ変更）
+
+## Usage
 
 ### 1. collect — クラスタから情報を収集
 
