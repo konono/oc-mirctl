@@ -83,6 +83,23 @@ var collectCmd = &cobra.Command{
 			finalResult = newResult
 		}
 
+		// マージ時: 前回の pull-secret.json の認証情報を保持する
+		// (前回だけ存在した private image の認証が失われないように)
+		if finalResult != newResult {
+			oldPSPath := filepath.Join(dir, "pull-secret.json")
+			if oldPS, err := os.ReadFile(oldPSPath); err == nil {
+				finalResult.MergePreviousPullSecret(oldPS)
+				fmt.Println("==> 前回の pull-secret.json から認証情報をマージ")
+			}
+
+			authFile := oldPSPath
+			if _, err := os.Stat(authFile); err != nil {
+				authFile = ""
+			}
+			fmt.Println("==> マージ後の PodImages で uncovered を再計算...")
+			finalResult.UncoveredImages = collector.DetectUncoveredImages(finalResult, authFile)
+		}
+
 		if err := finalResult.Save(dir); err != nil {
 			return fmt.Errorf("出力保存に失敗: %w", err)
 		}
@@ -105,11 +122,19 @@ var collectCmd = &cobra.Command{
 		}
 
 		fmt.Printf("\n収集完了: %s\n", dir)
-		fmt.Printf("  Cluster:        %s\n", finalResult.ClusterName)
-		fmt.Printf("  OCP Version:    %s\n", finalResult.OCPVersion)
-		fmt.Printf("  Operators:      %d\n", len(finalResult.Operators))
-		fmt.Printf("  Pod Images:     %d\n", len(finalResult.PodImages))
-		fmt.Printf("  Custom Images:  %d\n", len(finalResult.CustomImages))
+		fmt.Printf("  Cluster:          %s\n", finalResult.ClusterName)
+		fmt.Printf("  OCP Version:      %s\n", finalResult.OCPVersion)
+		fmt.Printf("  Operators:        %d\n", len(finalResult.Operators))
+		fmt.Printf("  Pod Images:       %d\n", len(finalResult.PodImages))
+		fmt.Printf("  Custom Images:    %d\n", len(finalResult.CustomImages))
+		fmt.Printf("  Uncovered Images: %d\n", len(finalResult.UncoveredImages))
+		if len(finalResult.UncoveredImages) > 0 {
+			fmt.Println("\n⚠ 以下のイメージは platform/operator でカバーされていません。")
+			fmt.Println("  generate で additionalImages に自動追加されます:")
+			for _, img := range finalResult.UncoveredImages {
+				fmt.Printf("    - %s\n", img)
+			}
+		}
 		return nil
 	},
 }

@@ -61,13 +61,26 @@ type Result struct {
 	OCPChannel     string         `json:"ocpChannel"`
 	ReleaseImage   string         `json:"releaseImage"`
 	Operators      []OperatorInfo `json:"operators"`
-	PodImages      []string       `json:"podImages"`
-	CustomImages   []string       `json:"customImages"`
+	PodImages        []string       `json:"podImages"`
+	CustomImages     []string       `json:"customImages"`
+	UncoveredImages  []string       `json:"uncoveredImages,omitempty"`
+	PrivateRegistries []string          `json:"privateRegistries,omitempty"`
+	PrivateImages     []string          `json:"privateImages,omitempty"`
 	CatalogSources    []CatalogInfo    `json:"catalogSources"`
 	PlatformImageSize int64            `json:"platformImageSize,omitempty"`
 	ImageSizes        map[string]int64 `json:"imageSizes,omitempty"`
 	CollectedAt       string           `json:"collectedAt"`
 	pullSecret        []byte
+}
+
+// IsPrivateImage はイメージが private registry 認証を必要とするかを判定する
+func (r *Result) IsPrivateImage(img string) bool {
+	for _, pi := range r.PrivateImages {
+		if img == pi {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Result) AllImages() []string {
@@ -87,7 +100,39 @@ func (r *Result) AllImages() []string {
 			images = append(images, img)
 		}
 	}
+	for _, img := range r.UncoveredImages {
+		if !seen[img] {
+			seen[img] = true
+			images = append(images, img)
+		}
+	}
 	return images
+}
+
+// MergePreviousPullSecret は前回保存した pull-secret.json から、
+// 今回の pullSecret に存在しないキーだけを補完する。
+// 同じレジストリの認証が更新された場合は今回の値を維持する。
+func (r *Result) MergePreviousPullSecret(oldPS []byte) {
+	if len(r.pullSecret) == 0 {
+		r.pullSecret = oldPS
+		return
+	}
+	currentAuths := parseDockerAuth(r.pullSecret)
+	if currentAuths == nil {
+		currentAuths = map[string]json.RawMessage{}
+	}
+	oldAuths := parseDockerAuth(oldPS)
+	for reg, auth := range oldAuths {
+		if _, exists := currentAuths[reg]; !exists {
+			currentAuths[reg] = auth
+		}
+	}
+	result := struct {
+		Auths map[string]json.RawMessage `json:"auths"`
+	}{Auths: currentAuths}
+	if merged, err := json.Marshal(result); err == nil {
+		r.pullSecret = merged
+	}
 }
 
 func New(kubeconfig string) (*Collector, error) {
@@ -180,6 +225,9 @@ func (c *Collector) Collect() (*Result, error) {
 	}
 	result.CatalogSources = catalogs
 
+	fmt.Println("==> 内部レジストリの ClusterIP を取得...")
+	c.resolveInternalRegistryIPs(ctx)
+
 	fmt.Println("==> Pod イメージを収集...")
 	podImages, err := c.getPodImages(ctx)
 	if err != nil {
@@ -196,6 +244,31 @@ func (c *Collector) Collect() (*Result, error) {
 		fmt.Printf("    WARN: pull-secret の取得に失敗: %v\n", err)
 	}
 
+	// Pod の imagePullSecrets から private registry を検出し、認証情報をマージ
+	fmt.Println("==> Pod imagePullSecrets から private registry を検出...")
+	privResult := c.collectPrivateRegistryAuth(ctx)
+	if len(privResult.registries) > 0 {
+		result.PrivateRegistries = privResult.registries
+		result.PrivateImages = privResult.images
+		fmt.Printf("    %d private registries 検出:\n", len(privResult.registries))
+		for _, reg := range privResult.registries {
+			fmt.Printf("      - %s\n", reg)
+		}
+		fmt.Printf("    %d private images:\n", len(privResult.images))
+		for _, img := range privResult.images {
+			fmt.Printf("      - %s\n", img)
+		}
+		if len(privResult.extraAuths) > 0 && len(result.pullSecret) > 0 {
+			merged, err := mergePullSecrets(result.pullSecret, privResult.extraAuths)
+			if err == nil {
+				result.pullSecret = merged
+				fmt.Println("    認証情報を pull-secret にマージしました")
+			} else {
+				fmt.Printf("    WARN: 認証情報のマージに失敗: %v\n", err)
+			}
+		}
+	}
+
 	fmt.Println("==> OCP リリースイメージのサイズを取得...")
 	authFile := ""
 	if len(result.pullSecret) > 0 {
@@ -210,7 +283,86 @@ func (c *Collector) Collect() (*Result, error) {
 		fmt.Printf("    WARN: リリースイメージサイズの取得に失敗: %v\n", err)
 	}
 
+	fmt.Println("==> Platform イメージ一覧を取得してカバレッジ分析...")
+	result.UncoveredImages = detectUncoveredImages(result, authFile)
+	if len(result.UncoveredImages) > 0 {
+		fmt.Printf("    ⚠ %d 個の未カバーイメージを検出:\n", len(result.UncoveredImages))
+		for _, img := range result.UncoveredImages {
+			fmt.Printf("      - %s\n", img)
+		}
+	} else {
+		fmt.Println("    全 Pod イメージがカバーされています")
+	}
+
 	return result, nil
+}
+
+// detectUncoveredImages は Pod で使用中のイメージのうち、platform リリースにも
+// operator relatedImages にも customImages にも含まれないイメージを検出する。
+// これらは additionalImages として明示的にミラーする必要がある。
+//
+// platform イメージは repo 名一致でカバー済みと判定する（リリース全体がミラーされるため）。
+// operator relatedImages は digest の完全一致で判定する（oc-mirror は CSV に記載された
+// 特定の digest のみミラーするため、同じ repo でも異なる digest は未ミラーになる）。
+// DetectUncoveredImages は Pod で使用中のイメージのうち、カバーされていないものを検出する。
+// Merge 後に再計算するために公開する。
+func DetectUncoveredImages(result *Result, authFile string) []string {
+	return detectUncoveredImages(result, authFile)
+}
+
+func detectUncoveredImages(result *Result, authFile string) []string {
+	// exactCovered: digest 完全一致でカバー済み
+	exactCovered := map[string]bool{}
+
+	// 1. Platform イメージ (oc adm release info から取得)
+	// platform はリリース全体がミラーされるので digest 完全一致で判定する。
+	// repo 名一致は使わない — 同一 repo に異なるコンポーネントが複数あり、
+	// repo 名だけでは無関係な digest までカバー済みと誤判定する。
+	exactCovered[result.ReleaseImage] = true // リリースイメージ自体もカバー済み
+	platformImages, err := GetPlatformImages(result.ReleaseImage, authFile)
+	if err != nil {
+		fmt.Printf("    WARN: platform イメージ一覧の取得に失敗: %v\n", err)
+	} else {
+		fmt.Printf("    Platform images: %d\n", len(platformImages))
+		for _, img := range platformImages {
+			exactCovered[img] = true
+		}
+	}
+
+	// 2. Operator relatedImages — digest 完全一致のみ
+	// oc-mirror は CSV の relatedImages に記載された特定 digest のみミラーする。
+	// 同じ repo でも Pod が異なる digest を使っていればミラーされない。
+	for _, op := range result.Operators {
+		for _, ri := range op.RelatedImages {
+			exactCovered[ri.Image] = true
+		}
+	}
+
+	// 3. CustomImages (既に additionalImages として追加される)
+	for _, img := range result.CustomImages {
+		exactCovered[img] = true
+	}
+
+	// 4. CatalogSource イメージ自体
+	for _, cs := range result.CatalogSources {
+		exactCovered[cs.Image] = true
+	}
+
+	var uncovered []string
+	for _, podImg := range result.PodImages {
+		if exactCovered[podImg] {
+			continue
+		}
+
+		if isInternalRegistry(registryFromImage(podImg)) {
+			continue
+		}
+
+		uncovered = append(uncovered, podImg)
+	}
+
+	sort.Strings(uncovered)
+	return uncovered
 }
 
 func (c *Collector) getPullSecret(ctx context.Context) ([]byte, error) {
@@ -436,6 +588,301 @@ func filterCustomImages(images []string) []string {
 	return custom
 }
 
+// staticInternalRegistries はクラスタ内部レジストリの既知ホスト名
+var staticInternalRegistries = map[string]bool{
+	"image-registry.openshift-image-registry.svc":                     true,
+	"image-registry.openshift-image-registry.svc:5000":                true,
+	"image-registry.openshift-image-registry.svc.cluster.local":       true,
+	"image-registry.openshift-image-registry.svc.cluster.local:5000":  true,
+}
+
+// resolvedInternalRegistries はクラスタから動的に取得した内部レジストリアドレス
+var resolvedInternalRegistries = map[string]bool{}
+
+// isInternalRegistry はホスト名が内部レジストリかどうかを判定する。
+// 静的リスト + クラスタから取得した Service ClusterIP で判定する。
+func isInternalRegistry(host string) bool {
+	if staticInternalRegistries[host] {
+		return true
+	}
+	if resolvedInternalRegistries[host] {
+		return true
+	}
+	return false
+}
+
+// resolveInternalRegistryIPs はクラスタの image-registry Service の ClusterIP を取得し、
+// 内部レジストリアドレスとして登録する。
+func (c *Collector) resolveInternalRegistryIPs(ctx context.Context) {
+	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "services"}
+	svc, err := c.client.Resource(gvr).Namespace("openshift-image-registry").Get(ctx, "image-registry", metav1.GetOptions{})
+	if err != nil {
+		return
+	}
+	clusterIP, _, _ := unstructured.NestedString(svc.Object, "spec", "clusterIP")
+	if clusterIP != "" {
+		resolvedInternalRegistries[clusterIP] = true
+		resolvedInternalRegistries[clusterIP+":5000"] = true
+		fmt.Printf("    内部レジストリ ClusterIP: %s\n", clusterIP)
+	}
+}
+
+// registryFromImage はイメージ参照からレジストリホスト名を抽出する
+func registryFromImage(img string) string {
+	// docker.io の暗黙参照 (nginx:latest, library/nginx:latest)
+	if !strings.Contains(strings.SplitN(img, "/", 2)[0], ".") &&
+		!strings.Contains(strings.SplitN(img, "/", 2)[0], ":") {
+		return "docker.io"
+	}
+	parts := strings.SplitN(img, "/", 2)
+	if len(parts) < 2 {
+		return "docker.io"
+	}
+	host := parts[0]
+	// ポート番号を含む場合 (myregistry.example.com:5000)
+	if idx := strings.Index(host, ":"); idx > 0 {
+		return host
+	}
+	return host
+}
+
+// privateRegistryResult は private registry 検出の結果
+type privateRegistryResult struct {
+	registries []string
+	images     []string
+	extraAuths [][]byte
+}
+
+// collectPrivateRegistryAuth は全 Pod の imagePullSecrets を収集し、
+// グローバル pull-secret と異なる認証情報を持つレジストリと、
+// そのレジストリのイメージを使っている Pod のイメージを特定する。
+func (c *Collector) collectPrivateRegistryAuth(ctx context.Context) *privateRegistryResult {
+	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
+	podList, err := c.client.Resource(gvr).Namespace("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return &privateRegistryResult{}
+	}
+
+	// グローバル pull-secret のレジストリ → 認証情報を取得
+	globalAuthMap := map[string]string{}
+	if ps, err := c.getPullSecret(ctx); err == nil {
+		globalAuthMap = extractAuthMap(ps)
+	}
+
+	// Pod → imagePullSecrets の Secret 参照を収集
+	type secretRef struct {
+		namespace string
+		name      string
+	}
+	// Secret 参照 → それを使う Pod のイメージ群
+	secretToPodImages := map[secretRef]map[string]bool{}
+	for _, pod := range podList.Items {
+		ns := pod.GetNamespace()
+		ips, _, _ := unstructured.NestedSlice(pod.Object, "spec", "imagePullSecrets")
+		if len(ips) == 0 {
+			continue
+		}
+
+		// この Pod のイメージを収集
+		podImgs := map[string]bool{}
+		containers, _, _ := unstructured.NestedSlice(pod.Object, "spec", "containers")
+		for _, c := range containers {
+			if cMap, ok := c.(map[string]interface{}); ok {
+				if img, ok := cMap["image"].(string); ok && img != "" {
+					podImgs[img] = true
+				}
+			}
+		}
+		initContainers, _, _ := unstructured.NestedSlice(pod.Object, "spec", "initContainers")
+		for _, c := range initContainers {
+			if cMap, ok := c.(map[string]interface{}); ok {
+				if img, ok := cMap["image"].(string); ok && img != "" {
+					podImgs[img] = true
+				}
+			}
+		}
+
+		for _, ref := range ips {
+			if refMap, ok := ref.(map[string]interface{}); ok {
+				if name, ok := refMap["name"].(string); ok && name != "" {
+					key := secretRef{namespace: ns, name: name}
+					if secretToPodImages[key] == nil {
+						secretToPodImages[key] = map[string]bool{}
+					}
+					for img := range podImgs {
+						secretToPodImages[key][img] = true
+					}
+				}
+			}
+		}
+	}
+
+	if len(secretToPodImages) == 0 {
+		return &privateRegistryResult{}
+	}
+
+	// Secret を取得して、private 認証を持つものを特定
+	secretGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
+	privateRegs := map[string]bool{}
+	privateImgs := map[string]bool{}
+	var extraAuths [][]byte
+
+	for ref, podImgs := range secretToPodImages {
+		secret, err := c.client.Resource(secretGVR).Namespace(ref.namespace).Get(ctx, ref.name, metav1.GetOptions{})
+		if err != nil {
+			continue
+		}
+
+		secretType, _, _ := unstructured.NestedString(secret.Object, "type")
+		if secretType != "kubernetes.io/dockerconfigjson" && secretType != "kubernetes.io/dockercfg" {
+			continue
+		}
+
+		dataMap, found, _ := unstructured.NestedMap(secret.Object, "data")
+		if !found {
+			continue
+		}
+
+		var encoded string
+		if v, ok := dataMap[".dockerconfigjson"].(string); ok {
+			encoded = v
+		} else if v, ok := dataMap[".dockercfg"].(string); ok {
+			encoded = v
+		}
+		if encoded == "" {
+			continue
+		}
+
+		decoded, err := base64Decode(encoded)
+		if err != nil {
+			continue
+		}
+
+		// グローバル pull-secret と比較
+		localAuthMap := extractAuthMap(decoded)
+		privateRegSet := map[string]bool{}
+		for reg, localAuth := range localAuthMap {
+			if isInternalRegistry(reg) {
+				continue
+			}
+			globalAuth, inGlobal := globalAuthMap[reg]
+			if !inGlobal || globalAuth != localAuth {
+				privateRegSet[reg] = true
+				privateRegs[reg] = true
+			}
+		}
+
+		if len(privateRegSet) > 0 {
+			extraAuths = append(extraAuths, decoded)
+			// この Secret を使う Pod のイメージのうち、
+			// private registry のホストに一致するものを private イメージとして記録
+			for img := range podImgs {
+				imgReg := registryFromImage(img)
+				if privateRegSet[imgReg] {
+					privateImgs[img] = true
+				}
+			}
+		}
+	}
+
+	var regs []string
+	for reg := range privateRegs {
+		regs = append(regs, reg)
+	}
+	sort.Strings(regs)
+
+	var imgs []string
+	for img := range privateImgs {
+		imgs = append(imgs, img)
+	}
+	sort.Strings(imgs)
+
+	return &privateRegistryResult{
+		registries: regs,
+		images:     imgs,
+		extraAuths: extraAuths,
+	}
+}
+
+// normalizeHost はレジストリ URL からホスト名を正規化する
+func normalizeHost(reg string) string {
+	host := reg
+	host = strings.TrimPrefix(host, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.TrimSuffix(host, "/")
+	return host
+}
+
+// parseDockerAuth は dockerconfigjson または .dockercfg 形式をパースし、
+// レジストリ → 認証情報の RawMessage マップを返す。
+// .dockercfg 形式: ルートに直接 {"registry": {"auth": "..."}} がある
+// dockerconfigjson 形式: {"auths": {"registry": {"auth": "..."}}} がある
+func parseDockerAuth(data []byte) map[string]json.RawMessage {
+	// まず dockerconfigjson 形式を試す
+	var dockerConfigJSON struct {
+		Auths map[string]json.RawMessage `json:"auths"`
+	}
+	if err := json.Unmarshal(data, &dockerConfigJSON); err == nil && len(dockerConfigJSON.Auths) > 0 {
+		return dockerConfigJSON.Auths
+	}
+
+	// .dockercfg 形式: ルートが直接 { "registry": { ... } } の形
+	var dockerCfg map[string]json.RawMessage
+	if err := json.Unmarshal(data, &dockerCfg); err == nil {
+		// "auths" キーが存在する場合は dockerconfigjson として扱う (auths が空だった場合)
+		if _, hasAuths := dockerCfg["auths"]; hasAuths {
+			return nil
+		}
+		return dockerCfg
+	}
+
+	return nil
+}
+
+// extractAuthMap は dockerconfigjson/.dockercfg からレジストリ → 認証情報の文字列表現のマップを返す
+func extractAuthMap(data []byte) map[string]string {
+	auths := parseDockerAuth(data)
+	result := map[string]string{}
+	for reg, auth := range auths {
+		result[normalizeHost(reg)] = string(auth)
+	}
+	return result
+}
+
+// extractRegistriesFromAuth は dockerconfigjson/.dockercfg からレジストリホスト名を抽出する
+func extractRegistriesFromAuth(data []byte) []string {
+	auths := parseDockerAuth(data)
+	var regs []string
+	for reg := range auths {
+		regs = append(regs, normalizeHost(reg))
+	}
+	return regs
+}
+
+// mergePullSecrets はグローバル pull-secret に追加の認証情報をマージする。
+// extras は dockerconfigjson または .dockercfg 形式のいずれでもよい。
+func mergePullSecrets(globalPS []byte, extras [][]byte) ([]byte, error) {
+	globalAuths := parseDockerAuth(globalPS)
+	if globalAuths == nil {
+		globalAuths = map[string]json.RawMessage{}
+	}
+
+	for _, extra := range extras {
+		extAuths := parseDockerAuth(extra)
+		for reg, auth := range extAuths {
+			// Pod の imagePullSecrets の認証を優先して上書きする。
+			// private repo では Pod 側の認証がアクセスに必要。
+			globalAuths[reg] = auth
+		}
+	}
+
+	// 出力は常に dockerconfigjson 形式 (auths ラッパー付き)
+	result := struct {
+		Auths map[string]json.RawMessage `json:"auths"`
+	}{Auths: globalAuths}
+	return json.Marshal(result)
+}
+
 // LoadPrevious は既存の collected-data.json を読み込む (マージ用)
 func LoadPrevious(dir string) (*Result, error) {
 	path := filepath.Join(dir, "collected-data.json")
@@ -471,6 +918,15 @@ func Merge(old, new *Result) *Result {
 
 	// --- CustomImages: 和集合 ---
 	merged.CustomImages = mergeStringSlices(old.CustomImages, new.CustomImages)
+
+	// --- UncoveredImages: マージ後の PodImages から再計算が必要 ---
+	// Merge 時点では authFile がないため再計算できない。
+	// collect.go 側で RecalculateUncovered を呼ぶ。暫定的に new を使う。
+	merged.UncoveredImages = new.UncoveredImages
+
+	// --- PrivateRegistries / PrivateImages: 和集合 ---
+	merged.PrivateRegistries = mergeStringSlices(old.PrivateRegistries, new.PrivateRegistries)
+	merged.PrivateImages = mergeStringSlices(old.PrivateImages, new.PrivateImages)
 
 	// --- CatalogSources: キー = namespace/name, image は最新 ---
 	merged.CatalogSources = mergeCatalogSources(old.CatalogSources, new.CatalogSources)

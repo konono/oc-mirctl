@@ -1,6 +1,8 @@
 package mirror
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -55,6 +57,17 @@ func (m *Mirror) Execute() error {
 	}
 	if m.destSkipTLS {
 		args = append(args, "--dest-tls-verify=false")
+	}
+	// pull-secret.json にミラー先の認証を追加して authfile として渡す
+	pullSecretFile := filepath.Join(m.outputDir, "pull-secret.json")
+	if _, err := os.Stat(pullSecretFile); err == nil {
+		authFile, err := addMirrorDestAuth(pullSecretFile, hostname+":8443")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "    WARN: ミラー先認証の追加に失敗: %v\n", err)
+			authFile = pullSecretFile
+		}
+		args = append(args, "--authfile", authFile)
+		fmt.Fprintf(os.Stderr, "==> 認証ファイル: %s\n", authFile)
 	}
 	args = append(args, "--log-level", "info")
 
@@ -230,4 +243,48 @@ info "  oc-mirctl apply --results-dir ${WORKSPACE}/working-dir/cluster-resources
 
 	fmt.Print(script)
 	return nil
+}
+
+// addMirrorDestAuth は pull-secret.json にミラー先レジストリの認証を追加した
+// 一時ファイルを作成して返す。MIRROR_USER / MIRROR_PASSWORD 環境変数で指定可能。
+func addMirrorDestAuth(pullSecretFile, mirrorDest string) (string, error) {
+	raw, err := os.ReadFile(pullSecretFile)
+	if err != nil {
+		return "", err
+	}
+
+	var config struct {
+		Auths map[string]json.RawMessage `json:"auths"`
+	}
+	if err := json.Unmarshal(raw, &config); err != nil {
+		return "", err
+	}
+	if config.Auths == nil {
+		config.Auths = map[string]json.RawMessage{}
+	}
+
+	// ミラー先の認証がなければ追加
+	if _, exists := config.Auths[mirrorDest]; !exists {
+		user := os.Getenv("MIRROR_USER")
+		if user == "" {
+			user = "init"
+		}
+		pass := os.Getenv("MIRROR_PASSWORD")
+		if pass == "" {
+			pass = "mirror-admin-password"
+		}
+		auth := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+		config.Auths[mirrorDest] = json.RawMessage(fmt.Sprintf(`{"auth":"%s"}`, auth))
+	}
+
+	merged, err := json.Marshal(config)
+	if err != nil {
+		return "", err
+	}
+
+	tmpFile := filepath.Join(filepath.Dir(pullSecretFile), ".pull-secret-merged.json")
+	if err := os.WriteFile(tmpFile, merged, 0600); err != nil {
+		return "", err
+	}
+	return tmpFile, nil
 }

@@ -31,8 +31,9 @@ type CollectedData struct {
 	OCPChannel     string          `json:"ocpChannel"`
 	ReleaseImage   string          `json:"releaseImage"`
 	Operators      []OperatorInfo  `json:"operators"`
-	CustomImages   []string        `json:"customImages"`
-	CatalogSources []CatalogSource `json:"catalogSources"`
+	CustomImages    []string        `json:"customImages"`
+	UncoveredImages []string        `json:"uncoveredImages"`
+	CatalogSources  []CatalogSource `json:"catalogSources"`
 }
 
 type RelatedImage struct {
@@ -233,7 +234,7 @@ func (g *Generator) GenerateImageSetConfig() error {
 		},
 	}
 
-	// カスタムイメージ + relatedImages から additionalImages を構築
+	// カスタムイメージ + relatedImages + 未カバーイメージから additionalImages を構築
 	additionalSet := map[string]bool{}
 	for _, img := range g.data.CustomImages {
 		additionalSet[img] = true
@@ -244,6 +245,9 @@ func (g *Generator) GenerateImageSetConfig() error {
 				additionalSet[ri.Image] = true
 			}
 		}
+	}
+	for _, img := range g.data.UncoveredImages {
+		additionalSet[img] = true
 	}
 	for img := range additionalSet {
 		if excludedImgs[img] {
