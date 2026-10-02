@@ -83,9 +83,16 @@ var collectCmd = &cobra.Command{
 			finalResult = newResult
 		}
 
-		// マージ後の PodImages (和集合) に対して uncovered を再計算
+		// マージ時: 前回の pull-secret.json の認証情報を保持する
+		// (前回だけ存在した private image の認証が失われないように)
 		if finalResult != newResult {
-			authFile := filepath.Join(dir, "pull-secret.json")
+			oldPSPath := filepath.Join(dir, "pull-secret.json")
+			if oldPS, err := os.ReadFile(oldPSPath); err == nil {
+				finalResult.MergePreviousPullSecret(oldPS)
+				fmt.Println("==> 前回の pull-secret.json から認証情報をマージ")
+			}
+
+			authFile := oldPSPath
 			if _, err := os.Stat(authFile); err != nil {
 				authFile = ""
 			}

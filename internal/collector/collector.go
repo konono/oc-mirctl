@@ -109,6 +109,19 @@ func (r *Result) AllImages() []string {
 	return images
 }
 
+// MergePreviousPullSecret は前回保存した pull-secret.json の認証情報を
+// 現在の pullSecret にマージする。前回だけ存在した private image の認証を保持するため。
+func (r *Result) MergePreviousPullSecret(oldPS []byte) {
+	if len(r.pullSecret) == 0 {
+		r.pullSecret = oldPS
+		return
+	}
+	merged, err := mergePullSecrets(r.pullSecret, [][]byte{oldPS})
+	if err == nil {
+		r.pullSecret = merged
+	}
+}
+
 func New(kubeconfig string) (*Collector, error) {
 	if kubeconfig == "" {
 		kubeconfig = os.Getenv("KUBECONFIG")
@@ -319,24 +332,13 @@ func detectUncoveredImages(result *Result, authFile string) []string {
 		exactCovered[cs.Image] = true
 	}
 
-	internalPrefixes := []string{
-		"image-registry.openshift-image-registry.svc",
-	}
-
 	var uncovered []string
 	for _, podImg := range result.PodImages {
 		if exactCovered[podImg] {
 			continue
 		}
 
-		isInternal := false
-		for _, prefix := range internalPrefixes {
-			if strings.HasPrefix(podImg, prefix) {
-				isInternal = true
-				break
-			}
-		}
-		if isInternal {
+		if isInternalRegistry(registryFromImage(podImg)) {
 			continue
 		}
 
@@ -572,8 +574,32 @@ func filterCustomImages(images []string) []string {
 
 // internalRegistries はクラスタ内部レジストリ (imagePullSecrets の判定から除外)
 var internalRegistries = map[string]bool{
-	"image-registry.openshift-image-registry.svc":       true,
-	"image-registry.openshift-image-registry.svc:5000":  true,
+	"image-registry.openshift-image-registry.svc":                true,
+	"image-registry.openshift-image-registry.svc:5000":           true,
+	"image-registry.openshift-image-registry.svc.cluster.local":       true,
+	"image-registry.openshift-image-registry.svc.cluster.local:5000":  true,
+}
+
+// isInternalRegistry は IP:port やホスト名がクラスタ内部レジストリかどうかを判定する。
+// 静的リストに加え、172.30.0.0/16 (Kubernetes service CIDR) のアドレスも内部と見なす。
+func isInternalRegistry(host string) bool {
+	if internalRegistries[host] {
+		return true
+	}
+	// IP:port 形式からホスト部分を抽出
+	ip := host
+	if idx := strings.LastIndex(host, ":"); idx > 0 {
+		ip = host[:idx]
+	}
+	// 172.30.x.x は OpenShift の service CIDR (ClusterIP)
+	if strings.HasPrefix(ip, "172.30.") {
+		return true
+	}
+	// 10.x.x.x も内部ネットワーク (pod/service CIDR)
+	if strings.HasPrefix(ip, "10.") {
+		return true
+	}
+	return false
 }
 
 // registryFromImage はイメージ参照からレジストリホスト名を抽出する
@@ -711,7 +737,7 @@ func (c *Collector) collectPrivateRegistryAuth(ctx context.Context) *privateRegi
 		localAuthMap := extractAuthMap(decoded)
 		privateRegSet := map[string]bool{}
 		for reg, localAuth := range localAuthMap {
-			if internalRegistries[reg] {
+			if isInternalRegistry(reg) {
 				continue
 			}
 			globalAuth, inGlobal := globalAuthMap[reg]
@@ -808,33 +834,28 @@ func extractRegistriesFromAuth(data []byte) []string {
 	return regs
 }
 
-// mergePullSecrets はグローバル pull-secret に追加の認証情報をマージする
+// mergePullSecrets はグローバル pull-secret に追加の認証情報をマージする。
+// extras は dockerconfigjson または .dockercfg 形式のいずれでもよい。
 func mergePullSecrets(globalPS []byte, extras [][]byte) ([]byte, error) {
-	var global struct {
-		Auths map[string]json.RawMessage `json:"auths"`
-	}
-	if err := json.Unmarshal(globalPS, &global); err != nil {
-		return nil, err
-	}
-	if global.Auths == nil {
-		global.Auths = map[string]json.RawMessage{}
+	globalAuths := parseDockerAuth(globalPS)
+	if globalAuths == nil {
+		globalAuths = map[string]json.RawMessage{}
 	}
 
 	for _, extra := range extras {
-		var ext struct {
-			Auths map[string]json.RawMessage `json:"auths"`
-		}
-		if err := json.Unmarshal(extra, &ext); err != nil {
-			continue
-		}
-		for reg, auth := range ext.Auths {
+		extAuths := parseDockerAuth(extra)
+		for reg, auth := range extAuths {
 			// Pod の imagePullSecrets の認証を優先して上書きする。
 			// private repo では Pod 側の認証がアクセスに必要。
-			global.Auths[reg] = auth
+			globalAuths[reg] = auth
 		}
 	}
 
-	return json.Marshal(global)
+	// 出力は常に dockerconfigjson 形式 (auths ラッパー付き)
+	result := struct {
+		Auths map[string]json.RawMessage `json:"auths"`
+	}{Auths: globalAuths}
+	return json.Marshal(result)
 }
 
 // LoadPrevious は既存の collected-data.json を読み込む (マージ用)
