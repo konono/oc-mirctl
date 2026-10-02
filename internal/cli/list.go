@@ -78,6 +78,7 @@ type SummaryInfo struct {
 	OperatorSizeBytes      int64 `json:"operatorSizeBytes" yaml:"operatorSizeBytes"`
 	ExcludedSizeBytes      int64 `json:"excludedSizeBytes" yaml:"excludedSizeBytes"`
 	CustomImageSizeBytes   int64 `json:"customImageSizeBytes" yaml:"customImageSizeBytes"`
+	UncoveredSizeBytes     int64 `json:"uncoveredSizeBytes" yaml:"uncoveredSizeBytes"`
 	TotalSizeBytes         int64 `json:"totalSizeBytes" yaml:"totalSizeBytes"`
 }
 
@@ -303,6 +304,9 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 			if s, ok := sizes[img]; ok {
 				info.SizeBytes = s
 				info.Size = collector.FormatSize(s)
+				if s > 0 {
+					output.Summary.UncoveredSizeBytes += s
+				}
 			}
 		}
 		output.UncoveredImages = append(output.UncoveredImages, info)
@@ -310,7 +314,7 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 	}
 
 	output.Summary.PlatformSizeBytes = data.PlatformImageSize
-	output.Summary.TotalSizeBytes = output.Summary.PlatformSizeBytes + output.Summary.OperatorSizeBytes + output.Summary.CustomImageSizeBytes
+	output.Summary.TotalSizeBytes = output.Summary.PlatformSizeBytes + output.Summary.OperatorSizeBytes + output.Summary.CustomImageSizeBytes + output.Summary.UncoveredSizeBytes
 
 	return output
 }
@@ -560,12 +564,15 @@ func printHumanList(output *ListOutput) {
 
 	fmt.Printf("\nTotal estimated size:\n")
 	if output.Summary.PlatformSizeBytes > 0 {
-		fmt.Printf("  Platform:  %s\n", collector.FormatSize(output.Summary.PlatformSizeBytes))
+		fmt.Printf("  Platform:    %s\n", collector.FormatSize(output.Summary.PlatformSizeBytes))
 	}
-	fmt.Printf("  Operators: %s\n", collector.FormatSize(output.Summary.OperatorSizeBytes))
-	fmt.Printf("  Images:    %s\n", collector.FormatSize(output.Summary.CustomImageSizeBytes))
+	fmt.Printf("  Operators:   %s\n", collector.FormatSize(output.Summary.OperatorSizeBytes))
+	fmt.Printf("  Images:      %s\n", collector.FormatSize(output.Summary.CustomImageSizeBytes))
+	if output.Summary.UncoveredSizeBytes > 0 {
+		fmt.Printf("  Uncovered:   %s\n", collector.FormatSize(output.Summary.UncoveredSizeBytes))
+	}
 	fmt.Printf("  ─────────────────\n")
-	fmt.Printf("  Total:     %s\n", collector.FormatSize(output.Summary.TotalSizeBytes))
+	fmt.Printf("  Total:       %s\n", collector.FormatSize(output.Summary.TotalSizeBytes))
 
 }
 

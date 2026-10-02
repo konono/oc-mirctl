@@ -83,6 +83,16 @@ var collectCmd = &cobra.Command{
 			finalResult = newResult
 		}
 
+		// マージ後の PodImages (和集合) に対して uncovered を再計算
+		if finalResult != newResult {
+			authFile := filepath.Join(dir, "pull-secret.json")
+			if _, err := os.Stat(authFile); err != nil {
+				authFile = ""
+			}
+			fmt.Println("==> マージ後の PodImages で uncovered を再計算...")
+			finalResult.UncoveredImages = collector.DetectUncoveredImages(finalResult, authFile)
+		}
+
 		if err := finalResult.Save(dir); err != nil {
 			return fmt.Errorf("出力保存に失敗: %w", err)
 		}

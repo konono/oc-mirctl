@@ -56,6 +56,13 @@ func (m *Mirror) Execute() error {
 	if m.destSkipTLS {
 		args = append(args, "--dest-tls-verify=false")
 	}
+	// pull-secret.json が存在すれば認証ファイルとして渡す
+	// (private registry の認証情報がマージ済み)
+	pullSecretFile := filepath.Join(m.outputDir, "pull-secret.json")
+	if _, err := os.Stat(pullSecretFile); err == nil {
+		args = append(args, "-a", pullSecretFile)
+		fmt.Fprintf(os.Stderr, "==> 認証ファイル: %s\n", pullSecretFile)
+	}
 	args = append(args, "--log-level", "info")
 
 	fmt.Fprintf(os.Stderr, "==> oc-mirror %s\n", strings.Join(args, " "))

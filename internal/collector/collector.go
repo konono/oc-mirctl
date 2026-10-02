@@ -275,14 +275,21 @@ func (c *Collector) Collect() (*Result, error) {
 // platform イメージは repo 名一致でカバー済みと判定する（リリース全体がミラーされるため）。
 // operator relatedImages は digest の完全一致で判定する（oc-mirror は CSV に記載された
 // 特定の digest のみミラーするため、同じ repo でも異なる digest は未ミラーになる）。
+// DetectUncoveredImages は Pod で使用中のイメージのうち、カバーされていないものを検出する。
+// Merge 後に再計算するために公開する。
+func DetectUncoveredImages(result *Result, authFile string) []string {
+	return detectUncoveredImages(result, authFile)
+}
+
 func detectUncoveredImages(result *Result, authFile string) []string {
-	// exactCovered: digest 完全一致でカバー済み (relatedImages, customImages 等)
+	// exactCovered: digest 完全一致でカバー済み
 	exactCovered := map[string]bool{}
-	// platformRepos: platform リリースに含まれる repo 名 (repo 名一致でカバー済み)
-	platformRepos := map[string]bool{}
 
 	// 1. Platform イメージ (oc adm release info から取得)
-	// platform はリリース全体がミラーされるので repo 名一致で十分
+	// platform はリリース全体がミラーされるので digest 完全一致で判定する。
+	// repo 名一致は使わない — 同一 repo に異なるコンポーネントが複数あり、
+	// repo 名だけでは無関係な digest までカバー済みと誤判定する。
+	exactCovered[result.ReleaseImage] = true // リリースイメージ自体もカバー済み
 	platformImages, err := GetPlatformImages(result.ReleaseImage, authFile)
 	if err != nil {
 		fmt.Printf("    WARN: platform イメージ一覧の取得に失敗: %v\n", err)
@@ -290,9 +297,6 @@ func detectUncoveredImages(result *Result, authFile string) []string {
 		fmt.Printf("    Platform images: %d\n", len(platformImages))
 		for _, img := range platformImages {
 			exactCovered[img] = true
-			if idx := strings.Index(img, "@sha256:"); idx > 0 {
-				platformRepos[img[:idx]] = true
-			}
 		}
 	}
 
@@ -334,13 +338,6 @@ func detectUncoveredImages(result *Result, authFile string) []string {
 		}
 		if isInternal {
 			continue
-		}
-
-		// platform イメージのみ repo 名一致でカバー済みと判定
-		if idx := strings.Index(podImg, "@sha256:"); idx > 0 {
-			if platformRepos[podImg[:idx]] {
-				continue
-			}
 		}
 
 		uncovered = append(uncovered, podImg)
@@ -756,43 +753,57 @@ func (c *Collector) collectPrivateRegistryAuth(ctx context.Context) *privateRegi
 	}
 }
 
-// extractAuthMap は dockerconfigjson からレジストリ → 認証情報の文字列表現のマップを返す
-func extractAuthMap(data []byte) map[string]string {
-	var config struct {
+// normalizeHost はレジストリ URL からホスト名を正規化する
+func normalizeHost(reg string) string {
+	host := reg
+	host = strings.TrimPrefix(host, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.TrimSuffix(host, "/")
+	return host
+}
+
+// parseDockerAuth は dockerconfigjson または .dockercfg 形式をパースし、
+// レジストリ → 認証情報の RawMessage マップを返す。
+// .dockercfg 形式: ルートに直接 {"registry": {"auth": "..."}} がある
+// dockerconfigjson 形式: {"auths": {"registry": {"auth": "..."}}} がある
+func parseDockerAuth(data []byte) map[string]json.RawMessage {
+	// まず dockerconfigjson 形式を試す
+	var dockerConfigJSON struct {
 		Auths map[string]json.RawMessage `json:"auths"`
 	}
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil
+	if err := json.Unmarshal(data, &dockerConfigJSON); err == nil && len(dockerConfigJSON.Auths) > 0 {
+		return dockerConfigJSON.Auths
 	}
 
+	// .dockercfg 形式: ルートが直接 { "registry": { ... } } の形
+	var dockerCfg map[string]json.RawMessage
+	if err := json.Unmarshal(data, &dockerCfg); err == nil {
+		// "auths" キーが存在する場合は dockerconfigjson として扱う (auths が空だった場合)
+		if _, hasAuths := dockerCfg["auths"]; hasAuths {
+			return nil
+		}
+		return dockerCfg
+	}
+
+	return nil
+}
+
+// extractAuthMap は dockerconfigjson/.dockercfg からレジストリ → 認証情報の文字列表現のマップを返す
+func extractAuthMap(data []byte) map[string]string {
+	auths := parseDockerAuth(data)
 	result := map[string]string{}
-	for reg, auth := range config.Auths {
-		host := reg
-		host = strings.TrimPrefix(host, "https://")
-		host = strings.TrimPrefix(host, "http://")
-		host = strings.TrimSuffix(host, "/")
-		result[host] = string(auth)
+	for reg, auth := range auths {
+		result[normalizeHost(reg)] = string(auth)
 	}
 	return result
 }
 
-// extractRegistriesFromAuth は dockerconfigjson からレジストリホスト名を抽出する
+// extractRegistriesFromAuth は dockerconfigjson/.dockercfg からレジストリホスト名を抽出する
 func extractRegistriesFromAuth(data []byte) []string {
-	var config struct {
-		Auths map[string]interface{} `json:"auths"`
-	}
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil
-	}
-
+	auths := parseDockerAuth(data)
 	var regs []string
-	for reg := range config.Auths {
-		// URLスキームを除去
-		host := reg
-		host = strings.TrimPrefix(host, "https://")
-		host = strings.TrimPrefix(host, "http://")
-		host = strings.TrimSuffix(host, "/")
-		regs = append(regs, host)
+	for reg := range auths {
+		regs = append(regs, normalizeHost(reg))
 	}
 	return regs
 }
@@ -817,10 +828,9 @@ func mergePullSecrets(globalPS []byte, extras [][]byte) ([]byte, error) {
 			continue
 		}
 		for reg, auth := range ext.Auths {
-			// グローバルに既にあるレジストリは上書きしない
-			if _, exists := global.Auths[reg]; !exists {
-				global.Auths[reg] = auth
-			}
+			// Pod の imagePullSecrets の認証を優先して上書きする。
+			// private repo では Pod 側の認証がアクセスに必要。
+			global.Auths[reg] = auth
 		}
 	}
 
@@ -863,7 +873,9 @@ func Merge(old, new *Result) *Result {
 	// --- CustomImages: 和集合 ---
 	merged.CustomImages = mergeStringSlices(old.CustomImages, new.CustomImages)
 
-	// --- UncoveredImages: 最新のみ (collect ごとに再計算されるため) ---
+	// --- UncoveredImages: マージ後の PodImages から再計算が必要 ---
+	// Merge 時点では authFile がないため再計算できない。
+	// collect.go 側で RecalculateUncovered を呼ぶ。暫定的に new を使う。
 	merged.UncoveredImages = new.UncoveredImages
 
 	// --- PrivateRegistries / PrivateImages: 和集合 ---
