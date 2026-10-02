@@ -105,11 +105,19 @@ var collectCmd = &cobra.Command{
 		}
 
 		fmt.Printf("\n収集完了: %s\n", dir)
-		fmt.Printf("  Cluster:        %s\n", finalResult.ClusterName)
-		fmt.Printf("  OCP Version:    %s\n", finalResult.OCPVersion)
-		fmt.Printf("  Operators:      %d\n", len(finalResult.Operators))
-		fmt.Printf("  Pod Images:     %d\n", len(finalResult.PodImages))
-		fmt.Printf("  Custom Images:  %d\n", len(finalResult.CustomImages))
+		fmt.Printf("  Cluster:          %s\n", finalResult.ClusterName)
+		fmt.Printf("  OCP Version:      %s\n", finalResult.OCPVersion)
+		fmt.Printf("  Operators:        %d\n", len(finalResult.Operators))
+		fmt.Printf("  Pod Images:       %d\n", len(finalResult.PodImages))
+		fmt.Printf("  Custom Images:    %d\n", len(finalResult.CustomImages))
+		fmt.Printf("  Uncovered Images: %d\n", len(finalResult.UncoveredImages))
+		if len(finalResult.UncoveredImages) > 0 {
+			fmt.Println("\n⚠ 以下のイメージは platform/operator でカバーされていません。")
+			fmt.Println("  generate で additionalImages に自動追加されます:")
+			for _, img := range finalResult.UncoveredImages {
+				fmt.Printf("    - %s\n", img)
+			}
+		}
 		return nil
 	},
 }

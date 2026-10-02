@@ -22,11 +22,12 @@ var (
 )
 
 type ListOutput struct {
-	Cluster   ClusterInfo        `json:"cluster" yaml:"cluster"`
-	Platform  PlatformInfo       `json:"platform" yaml:"platform"`
-	Operators []ListOperatorInfo `json:"operators" yaml:"operators"`
-	Images    []ListImageInfo    `json:"images" yaml:"images"`
-	Summary   SummaryInfo        `json:"summary" yaml:"summary"`
+	Cluster          ClusterInfo        `json:"cluster" yaml:"cluster"`
+	Platform         PlatformInfo       `json:"platform" yaml:"platform"`
+	Operators        []ListOperatorInfo `json:"operators" yaml:"operators"`
+	Images           []ListImageInfo    `json:"images" yaml:"images"`
+	UncoveredImages  []ListImageInfo    `json:"uncoveredImages,omitempty" yaml:"uncoveredImages,omitempty"`
+	Summary          SummaryInfo        `json:"summary" yaml:"summary"`
 }
 
 type ClusterInfo struct {
@@ -62,6 +63,7 @@ type ListImageInfo struct {
 	SizeBytes     int64  `json:"sizeBytes,omitempty" yaml:"sizeBytes,omitempty"`
 	Excluded      bool   `json:"excluded,omitempty" yaml:"excluded,omitempty"`
 	ExcludeReason string `json:"excludeReason,omitempty" yaml:"excludeReason,omitempty"`
+	Private       bool   `json:"private,omitempty" yaml:"private,omitempty"`
 }
 
 type SummaryInfo struct {
@@ -71,6 +73,7 @@ type SummaryInfo struct {
 	ExcludedRelatedImages  int   `json:"excludedRelatedImages" yaml:"excludedRelatedImages"`
 	ActiveImages           int   `json:"activeImages" yaml:"activeImages"`
 	ExcludedImages         int   `json:"excludedImages" yaml:"excludedImages"`
+	UncoveredImages        int   `json:"uncoveredImages" yaml:"uncoveredImages"`
 	PlatformSizeBytes      int64 `json:"platformSizeBytes" yaml:"platformSizeBytes"`
 	OperatorSizeBytes      int64 `json:"operatorSizeBytes" yaml:"operatorSizeBytes"`
 	ExcludedSizeBytes      int64 `json:"excludedSizeBytes" yaml:"excludedSizeBytes"`
@@ -264,6 +267,7 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 		info := ListImageInfo{
 			Name:      img,
 			ShortName: shortenImage(img),
+			Private:   data.IsPrivateImage(img),
 		}
 
 		excluded, reason := excl.IsImageExcluded(img)
@@ -286,6 +290,23 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 		}
 
 		output.Images = append(output.Images, info)
+	}
+
+	// Uncovered Images
+	for _, img := range data.UncoveredImages {
+		info := ListImageInfo{
+			Name:      img,
+			ShortName: shortenImage(img),
+			Private:   data.IsPrivateImage(img),
+		}
+		if sizes != nil {
+			if s, ok := sizes[img]; ok {
+				info.SizeBytes = s
+				info.Size = collector.FormatSize(s)
+			}
+		}
+		output.UncoveredImages = append(output.UncoveredImages, info)
+		output.Summary.UncoveredImages++
 	}
 
 	output.Summary.PlatformSizeBytes = data.PlatformImageSize
@@ -482,6 +503,8 @@ func printHumanList(output *ListOutput) {
 		st := ""
 		if img.Excluded {
 			st = "✗"
+		} else if img.Private {
+			st = "🔒"
 		}
 
 		imgRepo, imgTag, imgDigest := splitImageRef(img.Name)
@@ -498,6 +521,37 @@ func printHumanList(output *ListOutput) {
 	fmt.Printf("\nImages: %d active, %d excluded (%s)\n",
 		output.Summary.ActiveImages, output.Summary.ExcludedImages,
 		collector.FormatSize(output.Summary.CustomImageSizeBytes))
+
+	// Uncovered Images
+	if len(output.UncoveredImages) > 0 {
+		fmt.Printf("\n⚠ Uncovered Images (%d) — platform/operator でカバーされていないイメージ:\n", len(output.UncoveredImages))
+		tw = tablewriter.NewWriter(os.Stdout)
+		tw.SetHeader([]string{"", "Repository", "Tag", "Digest", "Size"})
+		tw.SetBorders(tablewriter.Border{Left: true, Top: true, Right: true, Bottom: true})
+		tw.SetAutoWrapText(false)
+		tw.SetColumnAlignment([]int{
+			tablewriter.ALIGN_CENTER,
+			tablewriter.ALIGN_LEFT,
+			tablewriter.ALIGN_LEFT,
+			tablewriter.ALIGN_LEFT,
+			tablewriter.ALIGN_RIGHT,
+		})
+
+		for _, img := range output.UncoveredImages {
+			st := ""
+			if img.Private {
+				st = "🔒"
+			}
+			imgRepo, imgTag, imgDigest := splitImageRef(img.Name)
+			sz := ""
+			if img.Size != "" {
+				sz = strings.TrimSpace(img.Size)
+			}
+			tw.Append([]string{st, imgRepo, imgTag, imgDigest, sz})
+		}
+		tw.Render()
+		fmt.Println("  → generate で additionalImages に自動追加されます")
+	}
 
 	if output.Summary.ExcludedSizeBytes > 0 {
 		fmt.Printf("\nExcluded: %s (%d images) — oc-mirctl exclude-list で確認\n",

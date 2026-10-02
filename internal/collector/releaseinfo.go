@@ -8,6 +8,36 @@ import (
 	"strings"
 )
 
+// GetPlatformImages は oc adm release info から platform リリースに含まれる
+// 全コンポーネントイメージを取得する
+func GetPlatformImages(releaseImage, authFile string) ([]string, error) {
+	if _, err := exec.LookPath("oc"); err != nil {
+		return nil, fmt.Errorf("oc コマンドが見つかりません")
+	}
+
+	args := []string{"adm", "release", "info", releaseImage, "-o", "jsonpath={.references.spec.tags[*].from.name}"}
+	if authFile != "" {
+		args = append(args, "-a", authFile)
+	}
+
+	cmd := exec.Command("oc", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("oc adm release info failed: %s", string(exitErr.Stderr))
+		}
+		return nil, err
+	}
+
+	raw := strings.TrimSpace(string(out))
+	if raw == "" {
+		return nil, fmt.Errorf("platform イメージが取得できませんでした")
+	}
+
+	images := strings.Fields(raw)
+	return images, nil
+}
+
 // GetReleaseImageSize は oc adm release info --size を使ってリリースイメージの
 // 全コンポーネントの SIZE MB を合計する
 func GetReleaseImageSize(releaseImage, authFile string) (int64, error) {
