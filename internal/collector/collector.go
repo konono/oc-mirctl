@@ -109,15 +109,28 @@ func (r *Result) AllImages() []string {
 	return images
 }
 
-// MergePreviousPullSecret は前回保存した pull-secret.json の認証情報を
-// 現在の pullSecret にマージする。前回だけ存在した private image の認証を保持するため。
+// MergePreviousPullSecret は前回保存した pull-secret.json から、
+// 今回の pullSecret に存在しないキーだけを補完する。
+// 同じレジストリの認証が更新された場合は今回の値を維持する。
 func (r *Result) MergePreviousPullSecret(oldPS []byte) {
 	if len(r.pullSecret) == 0 {
 		r.pullSecret = oldPS
 		return
 	}
-	merged, err := mergePullSecrets(r.pullSecret, [][]byte{oldPS})
-	if err == nil {
+	currentAuths := parseDockerAuth(r.pullSecret)
+	if currentAuths == nil {
+		currentAuths = map[string]json.RawMessage{}
+	}
+	oldAuths := parseDockerAuth(oldPS)
+	for reg, auth := range oldAuths {
+		if _, exists := currentAuths[reg]; !exists {
+			currentAuths[reg] = auth
+		}
+	}
+	result := struct {
+		Auths map[string]json.RawMessage `json:"auths"`
+	}{Auths: currentAuths}
+	if merged, err := json.Marshal(result); err == nil {
 		r.pullSecret = merged
 	}
 }
@@ -211,6 +224,9 @@ func (c *Collector) Collect() (*Result, error) {
 		return nil, err
 	}
 	result.CatalogSources = catalogs
+
+	fmt.Println("==> 内部レジストリの ClusterIP を取得...")
+	c.resolveInternalRegistryIPs(ctx)
 
 	fmt.Println("==> Pod イメージを収集...")
 	podImages, err := c.getPodImages(ctx)
@@ -572,34 +588,43 @@ func filterCustomImages(images []string) []string {
 	return custom
 }
 
-// internalRegistries はクラスタ内部レジストリ (imagePullSecrets の判定から除外)
-var internalRegistries = map[string]bool{
-	"image-registry.openshift-image-registry.svc":                true,
-	"image-registry.openshift-image-registry.svc:5000":           true,
+// staticInternalRegistries はクラスタ内部レジストリの既知ホスト名
+var staticInternalRegistries = map[string]bool{
+	"image-registry.openshift-image-registry.svc":                     true,
+	"image-registry.openshift-image-registry.svc:5000":                true,
 	"image-registry.openshift-image-registry.svc.cluster.local":       true,
 	"image-registry.openshift-image-registry.svc.cluster.local:5000":  true,
 }
 
-// isInternalRegistry は IP:port やホスト名がクラスタ内部レジストリかどうかを判定する。
-// 静的リストに加え、172.30.0.0/16 (Kubernetes service CIDR) のアドレスも内部と見なす。
+// resolvedInternalRegistries はクラスタから動的に取得した内部レジストリアドレス
+var resolvedInternalRegistries = map[string]bool{}
+
+// isInternalRegistry はホスト名が内部レジストリかどうかを判定する。
+// 静的リスト + クラスタから取得した Service ClusterIP で判定する。
 func isInternalRegistry(host string) bool {
-	if internalRegistries[host] {
+	if staticInternalRegistries[host] {
 		return true
 	}
-	// IP:port 形式からホスト部分を抽出
-	ip := host
-	if idx := strings.LastIndex(host, ":"); idx > 0 {
-		ip = host[:idx]
-	}
-	// 172.30.x.x は OpenShift の service CIDR (ClusterIP)
-	if strings.HasPrefix(ip, "172.30.") {
-		return true
-	}
-	// 10.x.x.x も内部ネットワーク (pod/service CIDR)
-	if strings.HasPrefix(ip, "10.") {
+	if resolvedInternalRegistries[host] {
 		return true
 	}
 	return false
+}
+
+// resolveInternalRegistryIPs はクラスタの image-registry Service の ClusterIP を取得し、
+// 内部レジストリアドレスとして登録する。
+func (c *Collector) resolveInternalRegistryIPs(ctx context.Context) {
+	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "services"}
+	svc, err := c.client.Resource(gvr).Namespace("openshift-image-registry").Get(ctx, "image-registry", metav1.GetOptions{})
+	if err != nil {
+		return
+	}
+	clusterIP, _, _ := unstructured.NestedString(svc.Object, "spec", "clusterIP")
+	if clusterIP != "" {
+		resolvedInternalRegistries[clusterIP] = true
+		resolvedInternalRegistries[clusterIP+":5000"] = true
+		fmt.Printf("    内部レジストリ ClusterIP: %s\n", clusterIP)
+	}
 }
 
 // registryFromImage はイメージ参照からレジストリホスト名を抽出する
