@@ -3,9 +3,11 @@ package collector
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -164,6 +166,7 @@ func FetchSizes(images []string, concurrency int, authFile string) map[string]in
 	total := len(images)
 	done := 0
 	cacheHits := 0
+	var failures []sizeFetchFailure
 
 	for _, img := range images {
 		// ダイジェスト参照で、キャッシュに成功結果があればスキップ
@@ -190,6 +193,7 @@ func FetchSizes(images []string, concurrency int, authFile string) map[string]in
 			done++
 			if err != nil {
 				result[image] = -1
+				failures = append(failures, sizeFetchFailure{Image: image, Err: err})
 			} else {
 				result[image] = size
 				// ダイジェスト参照の成功結果のみキャッシュ
@@ -213,7 +217,67 @@ func FetchSizes(images []string, concurrency int, authFile string) map[string]in
 		fmt.Fprintf(os.Stderr, "    cache hit: %d/%d\n", cacheHits, total)
 	}
 
+	reportSizeFetchFailures(os.Stderr, failures, total-cacheHits)
+
 	return result
+}
+
+// sizeFetchFailure はサイズ取得に失敗したイメージとそのエラー
+type sizeFetchFailure struct {
+	Image string
+	Err   error
+}
+
+// maxReportedFailures は失敗理由を詳細表示するイメージの最大件数
+const maxReportedFailures = 5
+
+// maxErrorLineLen はエラー 1 行の最大表示文字数 (rune 単位)
+const maxErrorLineLen = 300
+
+// reportSizeFetchFailures はサイズ取得の失敗件数・先頭数件の理由を表示し、
+// 取得を試みた全イメージが失敗した場合は原因のヒントを警告として出す。
+// attempted はキャッシュヒットを除いた、実際に skopeo で取得を試みた件数。
+func reportSizeFetchFailures(w io.Writer, failures []sizeFetchFailure, attempted int) {
+	if len(failures) == 0 {
+		return
+	}
+
+	// goroutine の完了順に依存しないよう、表示順をイメージ名で固定する
+	sort.Slice(failures, func(i, j int) bool { return failures[i].Image < failures[j].Image })
+
+	fmt.Fprintf(w, "    WARN: %d/%d イメージのサイズ取得に失敗 (list では unknown と表示されます)\n",
+		len(failures), attempted)
+
+	n := len(failures)
+	if n > maxReportedFailures {
+		n = maxReportedFailures
+	}
+	for _, f := range failures[:n] {
+		fmt.Fprintf(w, "      - %s\n", f.Image)
+		fmt.Fprintf(w, "          %s\n", summarizeError(f.Err))
+	}
+	if len(failures) > n {
+		fmt.Fprintf(w, "      ... 他 %d 件\n", len(failures)-n)
+	}
+
+	if len(failures) == attempted {
+		fmt.Fprintln(w, "    WARN: 全イメージのサイズ取得に失敗しました。以下を確認してください:")
+		fmt.Fprintln(w, "      - プロキシ: HTTPS_PROXY / NO_PROXY (レジストリのドメインが NO_PROXY に必要か)")
+		fmt.Fprintln(w, "      - 認証: pull-secret.json が存在し、対象レジストリの認証情報を含むか")
+		fmt.Fprintln(w, "      - skopeo: インストール済みで PATH に含まれるか")
+		fmt.Fprintln(w, "      手動確認: skopeo inspect --raw --authfile <pull-secret.json> docker://<image>")
+	}
+}
+
+// summarizeError はエラーメッセージ (skopeo の stderr を含む) を 1 行に整形する。
+// skopeo のエラーは前置きが長く根本原因 (proxyconnect, unauthorized 等) が末尾に来るため、
+// 長すぎる場合は末尾側を残す。
+func summarizeError(err error) string {
+	msg := strings.Join(strings.Fields(err.Error()), " ")
+	if r := []rune(msg); len(r) > maxErrorLineLen {
+		msg = "..." + string(r[len(r)-maxErrorLineLen:])
+	}
+	return msg
 }
 
 func FormatSize(bytes int64) string {
