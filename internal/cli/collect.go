@@ -21,6 +21,8 @@ var collectCmd = &cobra.Command{
   - 全 Pod で使用中のコンテナイメージ
 
 出力先: ./mirror_data/<cluster-name>/
+  current-data.json   今回の収集結果のみ (list / generate のデフォルト)
+  collected-data.json 過去の収集結果との和集合 (list / generate の --all)
 既存の collected-data.json がある場合、差分があればバックアップを取ってマージする`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c, err := collector.New(kubeconfig)
@@ -119,6 +121,13 @@ var collectCmd = &cobra.Command{
 			if err := os.WriteFile(filepath.Join(dir, "collected-data.json"), data, 0644); err != nil {
 				return fmt.Errorf("サイズ情報の保存に失敗: %w", err)
 			}
+		}
+
+		// 今回の collect 結果のみのスナップショット (マージ前の newResult) を保存。
+		// list / generate はデフォルトでこちらを使い、--all で累積データを使う。
+		current := collector.CurrentSnapshot(newResult, finalResult.ImageSizes)
+		if err := current.SaveCurrent(dir); err != nil {
+			return fmt.Errorf("current-data.json の保存に失敗: %w", err)
 		}
 
 		fmt.Printf("\n収集完了: %s\n", dir)

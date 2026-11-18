@@ -22,8 +22,19 @@ type ExclusionEntry struct {
 type Generator struct {
 	outputDir      string
 	mirrorRegistry string
+	opts           Options
 	data           *CollectedData
 	exclusions     *Exclusions
+}
+
+// Options は ImageSetConfiguration 生成の挙動を制御する
+type Options struct {
+	// DataFile は outputDir 配下の入力データファイル名
+	// (current-data.json = 最新状態のみ / collected-data.json = 累積)
+	DataFile string
+	// PinOperators が true の場合、Operator を現行 CSV のバージョンに固定する
+	// (maxVersion = minVersion)。false の場合は現行〜チャネル最新をミラーする。
+	PinOperators bool
 }
 
 type CollectedData struct {
@@ -116,16 +127,19 @@ type ImageDigestSource struct {
 	Source  string   `json:"source"`
 }
 
-func New(outputDir, mirrorRegistry string) (*Generator, error) {
-	dataFile := filepath.Join(outputDir, "collected-data.json")
+func New(outputDir, mirrorRegistry string, opts Options) (*Generator, error) {
+	if opts.DataFile == "" {
+		opts.DataFile = "collected-data.json"
+	}
+	dataFile := filepath.Join(outputDir, opts.DataFile)
 	raw, err := os.ReadFile(dataFile)
 	if err != nil {
-		return nil, fmt.Errorf("collected-data.json の読み込みに失敗: %w", err)
+		return nil, fmt.Errorf("%s の読み込みに失敗: %w", opts.DataFile, err)
 	}
 
 	var data CollectedData
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, fmt.Errorf("collected-data.json のパースに失敗: %w", err)
+		return nil, fmt.Errorf("%s のパースに失敗: %w", opts.DataFile, err)
 	}
 
 	// exclusions を読み込み (なければ空)
@@ -138,6 +152,7 @@ func New(outputDir, mirrorRegistry string) (*Generator, error) {
 	return &Generator{
 		outputDir:      outputDir,
 		mirrorRegistry: mirrorRegistry,
+		opts:           opts,
 		data:           &data,
 		exclusions:     &excl,
 	}, nil
@@ -180,6 +195,9 @@ func (g *Generator) GenerateImageSetConfig() error {
 			ch := PkgChannelRef{Name: op.Channel}
 			if op.Version != "" {
 				ch.MinVersion = extractVersion(op.Version, op.PackageName)
+				if g.opts.PinOperators {
+					ch.MaxVersion = ch.MinVersion
+				}
 			}
 			pkg.Channels = []PkgChannelRef{ch}
 			if op.DefaultChannel != "" && !channelSet[op.DefaultChannel] {

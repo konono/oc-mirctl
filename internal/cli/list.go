@@ -16,6 +16,7 @@ import (
 
 var (
 	showExcluded bool
+	listAll      bool
 	outputFormat string
 	authFile     string
 	concurrency  int
@@ -113,6 +114,9 @@ var listCmd = &cobra.Command{
 	Long: `収集済みのデータを一覧表示する。
 各 Operator の relatedImages とサイズを表示する。
 
+デフォルトでは直近の collect 結果 (current-data.json) のみを表示する。
+
+  --all     過去の collect 結果との和集合 (collected-data.json) を表示
   -o json   JSON 形式で出力
   -o yaml   YAML 形式で出力`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -121,10 +125,11 @@ var listCmd = &cobra.Command{
 			return err
 		}
 
-		data, err := collector.LoadPrevious(dir)
+		data, err := collector.LoadData(dir, listAll)
 		if err != nil {
-			return fmt.Errorf("collected-data.json の読み込みに失敗: %w", err)
+			return err
 		}
+		fmt.Fprintf(os.Stderr, "==> 入力: %s\n", collector.DataFile(listAll))
 
 		excl, err := collector.LoadExclusions(dir)
 		if err != nil {
@@ -134,7 +139,7 @@ var listCmd = &cobra.Command{
 		var imageSizes map[string]int64
 		if len(data.ImageSizes) > 0 {
 			imageSizes = data.ImageSizes
-			fmt.Fprintf(os.Stderr, "==> collected-data.json のサイズ情報を使用 (%d イメージ)\n", len(imageSizes))
+			fmt.Fprintf(os.Stderr, "==> %s のサイズ情報を使用 (%d イメージ)\n", collector.DataFile(listAll), len(imageSizes))
 		} else {
 			af := authFile
 			if af == "" {
@@ -578,6 +583,7 @@ func printHumanList(output *ListOutput) {
 
 func init() {
 	listCmd.Flags().BoolVar(&showExcluded, "show-excluded", false, "除外済みの項目も表示する")
+	listCmd.Flags().BoolVar(&listAll, "all", false, "過去の collect 結果との和集合 (collected-data.json) を表示する")
 	listCmd.Flags().StringVarP(&outputFormat, "output", "o", "", "出力形式 (json, yaml)")
 	listCmd.Flags().StringVar(&authFile, "authfile", "", "レジストリ認証ファイル (default: 自動検出)")
 	listCmd.Flags().IntVar(&concurrency, "concurrency", 50, "サイズ取得の並列数")
