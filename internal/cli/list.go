@@ -744,7 +744,6 @@ func printHumanList(output *ListOutput) {
 	}
 	fmt.Printf("  ─────────────────\n")
 	fmt.Printf("  Total:       %s\n", collector.FormatSize(output.Summary.TotalSizeBytes))
-	fmt.Println("  (同じイメージは 1 回だけ数えています。単位は 1000 単位の KB / MB / GB / TB)")
 
 }
 
