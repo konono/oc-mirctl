@@ -92,6 +92,12 @@ type SummaryInfo struct {
 	ExcludedSizeBytes      int64 `json:"excludedSizeBytes" yaml:"excludedSizeBytes"`
 	CustomImageSizeBytes   int64 `json:"customImageSizeBytes" yaml:"customImageSizeBytes"`
 	UncoveredSizeBytes     int64 `json:"uncoveredSizeBytes" yaml:"uncoveredSizeBytes"`
+	IdleSizeBytes          int64 `json:"idleSizeBytes" yaml:"idleSizeBytes"`
+	UnusedSizeBytes        int64 `json:"unusedSizeBytes,omitempty" yaml:"unusedSizeBytes,omitempty"`
+	// UniqueRelatedImages は有効な relatedImages を重複 (同じイメージの別名) を除いて数えた件数
+	UniqueRelatedImages    int   `json:"uniqueRelatedImages" yaml:"uniqueRelatedImages"`
+	// 各 *SizeBytes と TotalSizeBytes は、同じイメージを複数の箇所で数えないよう、
+	// Operators → Images → Uncovered → Idle → Unused の順に初出の 1 回だけ計上する
 	TotalSizeBytes         int64 `json:"totalSizeBytes" yaml:"totalSizeBytes"`
 }
 
@@ -220,6 +226,33 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 		},
 	}
 
+	// 合計は同じイメージを 1 回だけ数える。relatedImages には同じイメージが別名で複数回
+	// 現れることがあり (例: vllm の *_fast_1_image / *_fast_2_image)、Operator の
+	// relatedImages と Pod のイメージ (Custom Images) も重なるため。
+	// サイズは参照ごとではなくイメージ (imageKey) ごとに集約する。同じイメージの参照の
+	// 一部だけサイズ取得に失敗していても (例: repo:tag@digest は未取得、repo@digest は取得済み)、
+	// どの参照が先に数えられても取得できたサイズを使う。
+	keySize := map[string]int64{}
+	for ref, s := range sizes {
+		if k := imageKey(ref); s > keySize[k] {
+			keySize[k] = s
+		}
+	}
+	sizeOf := func(img string) int64 {
+		return keySize[imageKey(img)]
+	}
+	counted := map[string]bool{}
+	excludedCounted := map[string]bool{}
+	countOnce := func(set map[string]bool, img string) int64 {
+		k := imageKey(img)
+		if set[k] {
+			return 0
+		}
+		set[k] = true
+		return sizeOf(img)
+	}
+	uniqueRelated := map[string]bool{}
+
 	for _, op := range data.Operators {
 		info := ListOperatorInfo{
 			PackageName:   op.PackageName,
@@ -248,6 +281,7 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 
 		var total int64
 		activeCount := 0
+		opSeen := map[string]bool{} // Operator 内の重複を除いて Operator のサイズを求める
 		for _, ri := range op.RelatedImages {
 			imgInfo := ListImageInfo{
 				Name:      ri.Image,
@@ -260,18 +294,17 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 				imgInfo.Excluded = true
 				imgInfo.ExcludeReason = imgReason
 				output.Summary.ExcludedRelatedImages++
-				if sizes != nil {
-					if s, ok := sizes[ri.Image]; ok && s > 0 {
-						output.Summary.ExcludedSizeBytes += s
-					}
-				}
+				output.Summary.ExcludedSizeBytes += countOnce(excludedCounted, ri.Image)
 			} else {
 				activeCount++
 				output.Summary.ActiveRelatedImages++
-				if sizes != nil {
-					if s, ok := sizes[ri.Image]; ok && s > 0 {
-						total += s
-					}
+				if k := imageKey(ri.Image); !opSeen[k] {
+					opSeen[k] = true
+					total += sizeOf(ri.Image)
+				}
+				if !info.Excluded {
+					uniqueRelated[imageKey(ri.Image)] = true
+					output.Summary.OperatorSizeBytes += countOnce(counted, ri.Image)
 				}
 			}
 
@@ -287,9 +320,6 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 		if total > 0 {
 			info.SizeBytes = total
 			info.Size = collector.FormatSize(total)
-			if !info.Excluded {
-				output.Summary.OperatorSizeBytes += total
-			}
 		}
 
 		output.Operators = append(output.Operators, info)
@@ -315,8 +345,8 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 			if s, ok := sizes[img]; ok {
 				info.SizeBytes = s
 				info.Size = collector.FormatSize(s)
-				if !info.Excluded && s > 0 {
-					output.Summary.CustomImageSizeBytes += s
+				if !info.Excluded {
+					output.Summary.CustomImageSizeBytes += countOnce(counted, img)
 				}
 			}
 		}
@@ -335,9 +365,7 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 			if s, ok := sizes[img]; ok {
 				info.SizeBytes = s
 				info.Size = collector.FormatSize(s)
-				if s > 0 {
-					output.Summary.UncoveredSizeBytes += s
-				}
+				output.Summary.UncoveredSizeBytes += countOnce(counted, img)
 			}
 		}
 		output.UncoveredImages = append(output.UncoveredImages, info)
@@ -358,6 +386,9 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 				info.SizeBytes = s
 				info.Size = collector.FormatSize(s)
 			}
+			if !info.Excluded {
+				output.Summary.IdleSizeBytes += countOnce(counted, ii.Image)
+			}
 			output.IdleImages = append(output.IdleImages, info)
 		}
 	}
@@ -372,14 +403,37 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 				info.SizeBytes = s
 				info.Size = collector.FormatSize(s)
 			}
+			if excluded, reason := excl.IsImageExcluded(img); excluded {
+				info.Excluded = true
+				info.ExcludeReason = reason
+			} else {
+				output.Summary.UnusedSizeBytes += countOnce(counted, img)
+			}
 			output.UnusedImages = append(output.UnusedImages, info)
 		}
 	}
 
 	output.Summary.PlatformSizeBytes = data.PlatformImageSize
-	output.Summary.TotalSizeBytes = output.Summary.PlatformSizeBytes + output.Summary.OperatorSizeBytes + output.Summary.CustomImageSizeBytes + output.Summary.UncoveredSizeBytes
+	output.Summary.UniqueRelatedImages = len(uniqueRelated)
+	output.Summary.TotalSizeBytes = output.Summary.PlatformSizeBytes + output.Summary.OperatorSizeBytes +
+		output.Summary.CustomImageSizeBytes + output.Summary.UncoveredSizeBytes +
+		output.Summary.IdleSizeBytes + output.Summary.UnusedSizeBytes
 
 	return output
+}
+
+// imageKey はサイズの重複判定用のキーを返す。repo:tag@digest は repo@digest と同じイメージ
+// として扱う (同じ digest をタグ付き / タグなしで参照していても 1 つと数える)。
+func imageKey(img string) string {
+	at := strings.Index(img, "@sha256:")
+	if at < 0 {
+		return img
+	}
+	repo := img[:at]
+	if i := strings.LastIndex(repo, ":"); i > strings.LastIndex(repo, "/") {
+		repo = repo[:i]
+	}
+	return repo + img[at:]
 }
 
 // splitImageRef はイメージ参照を registry/repo と tag/digest に分離する
@@ -547,13 +601,17 @@ func printHumanList(output *ListOutput) {
 	}
 
 	fmt.Printf("Operators: %d active, %d excluded\n", output.Summary.ActiveOperators, output.Summary.ExcludedOperators)
+	related := fmt.Sprintf("%d", output.Summary.ActiveRelatedImages)
+	if output.Summary.UniqueRelatedImages != output.Summary.ActiveRelatedImages {
+		related += fmt.Sprintf(" (重複を除くと %d)", output.Summary.UniqueRelatedImages)
+	}
 	if output.Summary.ExcludedRelatedImages > 0 {
-		fmt.Printf("  relatedImages: %d active (%s), %d excluded (%s)\n",
-			output.Summary.ActiveRelatedImages, collector.FormatSize(output.Summary.OperatorSizeBytes),
-			output.Summary.ExcludedRelatedImages, collector.FormatSize(output.Summary.ExcludedSizeBytes))
+		fmt.Printf("  relatedImages: %s active (%s), %d excluded (%s)\n",
+			related, strings.TrimSpace(collector.FormatSize(output.Summary.OperatorSizeBytes)),
+			output.Summary.ExcludedRelatedImages, strings.TrimSpace(collector.FormatSize(output.Summary.ExcludedSizeBytes)))
 	} else {
-		fmt.Printf("  relatedImages: %d (%s)\n",
-			output.Summary.ActiveRelatedImages, collector.FormatSize(output.Summary.OperatorSizeBytes))
+		fmt.Printf("  relatedImages: %s (%s)\n",
+			related, strings.TrimSpace(collector.FormatSize(output.Summary.OperatorSizeBytes)))
 	}
 	fmt.Println()
 
@@ -678,8 +736,15 @@ func printHumanList(output *ListOutput) {
 	if output.Summary.UncoveredSizeBytes > 0 {
 		fmt.Printf("  Uncovered:   %s\n", collector.FormatSize(output.Summary.UncoveredSizeBytes))
 	}
+	if output.Summary.IdleSizeBytes > 0 {
+		fmt.Printf("  Idle:        %s\n", collector.FormatSize(output.Summary.IdleSizeBytes))
+	}
+	if output.Summary.UnusedSizeBytes > 0 {
+		fmt.Printf("  Unused:      %s\n", collector.FormatSize(output.Summary.UnusedSizeBytes))
+	}
 	fmt.Printf("  ─────────────────\n")
 	fmt.Printf("  Total:       %s\n", collector.FormatSize(output.Summary.TotalSizeBytes))
+	fmt.Println("  (同じイメージは 1 回だけ数えています。単位は 1000 単位の KB / MB / GB / TB)")
 
 }
 

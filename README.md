@@ -168,6 +168,11 @@ oc-mirctl list -o yaml
 
 サイズ情報は `collect` 時に取得済みのデータを使用するため、オフラインでも即座に表示される。
 
+サイズは 1000 単位 (KB / MB / GB / TB) で表示する。合計 (Total estimated size) は、同じイメージ
+(relatedImages 内の別名、Operator 間や Pod のイメージとの重なり) を 1 回だけ数える。
+Platform のサイズは `oc adm release info --size` の合計 (コンポーネント間で共有されるレイヤーを重複なく数えた値) で、
+クラスタのアーキテクチャを `--filter-by-os` に指定して取得する。
+
 ### 3. exclude / include — mirror 対象の調整
 
 不要な Operator やイメージを除外リストで管理する。`generate` 時に除外リストが反映される。
