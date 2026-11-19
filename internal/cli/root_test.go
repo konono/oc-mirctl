@@ -48,6 +48,15 @@ func TestResolveVersion(t *testing.T) {
 			wantV: "v0.1.1-0.20261119073140-dcae204670a9", wantC: "dcae204670a9", wantD: "2026-11-19T07:31:40Z",
 		},
 		{
+			name: "ldflags のコミットには vcs.modified があっても -dirty を付けない",
+			v:    "v0.1.0", c: "abc1234", d: "2026-11-19T00:00:00Z",
+			info: &debug.BuildInfo{Main: debug.Module{Version: "(devel)"}, Settings: []debug.BuildSetting{
+				{Key: "vcs.revision", Value: "6a469f5696396f0e448eb11b5c83a7c8a9d05289"},
+				{Key: "vcs.modified", Value: "true"},
+			}},
+			wantV: "v0.1.0", wantC: "abc1234", wantD: "2026-11-19T00:00:00Z",
+		},
+		{
 			name: "ビルド情報なし",
 			v:    "dev", c: "unknown", d: "unknown", info: nil,
 			wantV: "dev", wantC: "unknown", wantD: "unknown",

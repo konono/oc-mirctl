@@ -49,6 +49,7 @@ func resolveVersion(v, c, d string, info *debug.BuildInfo) (string, string, stri
 		v = info.Main.Version
 	}
 	modified := false
+	fromVCS := false // commit をビルド情報 (vcs.revision) から取ったか
 	for _, s := range info.Settings {
 		switch s.Key {
 		case "vcs.revision":
@@ -57,6 +58,7 @@ func resolveVersion(v, c, d string, info *debug.BuildInfo) (string, string, stri
 				if len(c) > 12 {
 					c = c[:12]
 				}
+				fromVCS = true
 			}
 		case "vcs.time":
 			if d == "unknown" && s.Value != "" {
@@ -66,7 +68,8 @@ func resolveVersion(v, c, d string, info *debug.BuildInfo) (string, string, stri
 			modified = s.Value == "true"
 		}
 	}
-	if modified && c != "unknown" {
+	// -dirty はビルド情報から取ったコミットにだけ付ける (ldflags で指定された値は変えない)
+	if modified && fromVCS {
 		c += "-dirty"
 	}
 	// go install (モジュールプロキシ経由) では vcs.* が入らないので、

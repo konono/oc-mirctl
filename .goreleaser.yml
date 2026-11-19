@@ -1,0 +1,32 @@
+version: 2
+
+release:
+  # release-please が作った Release にアセットを追加する (本文は上書きしない)
+  mode: keep-existing
+
+builds:
+  - main: ./cmd/oc-mirctl
+    binary: oc-mirctl
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/konono/oc-mirctl/internal/cli.version={{ .Tag }}
+      - -X github.com/konono/oc-mirctl/internal/cli.commit={{ .ShortCommit }}
+      - -X github.com/konono/oc-mirctl/internal/cli.buildDate={{ .Date }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .Binary }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
