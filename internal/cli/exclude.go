@@ -165,8 +165,18 @@ func excludeByMatch(data *collector.Result, excl *collector.Exclusions, pattern 
 		}
 	}
 
-	// customImages でもマッチ
-	for _, img := range data.CustomImages {
+	// customImages / uncoveredImages / unusedImages (generate --all で対象) でもマッチ
+	seen := map[string]bool{}
+	var images []string
+	for _, list := range [][]string{data.CustomImages, data.UncoveredImages, data.UnusedImages} {
+		for _, img := range list {
+			if !seen[img] {
+				seen[img] = true
+				images = append(images, img)
+			}
+		}
+	}
+	for _, img := range images {
 		imageMatch, _ := filepath.Match(pattern, img)
 		baseName := img
 		if idx := strings.LastIndex(baseName, "/"); idx >= 0 {

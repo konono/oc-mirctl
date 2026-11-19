@@ -29,8 +29,7 @@ make cross
 ```
 mirror_data/                          # 固定ベースディレクトリ (変更不可)
   └─ <cluster-name>/                  # collect 時にクラスタ名で自動作成
-      ├── current-data.json           # 最新の収集データのみ (collect が毎回上書き)
-      ├── collected-data.json         # 累積の収集データ (collect が和集合マージ)
+      ├── collected-data.json         # 収集データ (collect が毎回上書き)
       ├── exclusions.json             # 除外リスト (exclude/include が管理)
       ├── imageset-config.yaml        # ImageSetConfiguration (generate が生成)
       ├── disconnected-overrides.yaml # disconnected 設定 (generate が生成)
@@ -44,7 +43,7 @@ mirror_data/                          # 固定ベースディレクトリ (変�
 **設計方針**:
 - ベースディレクトリを固定することで `--output-dir` の指定ミスによるデータの散逸を防ぐ
 - クラスタ名のサブディレクトリにより、複数クラスタのデータを共存可能（ただし1クラスタのみの場合は自動検出）
-- `collect` を再実行すると前回データとマージされ、差分がある場合のみ `backups/` にバックアップを作成
+- `collect` を再実行するとその時点の情報で上書きされ、前回データと差分がある場合のみ `backups/` にバックアップを作成
 - `exclusions.json` は `collect` では上書きされない（exclude/include コマンドでのみ変更）
 
 ## Usage
@@ -58,29 +57,38 @@ mirror_data/                          # 固定ベースディレクトリ (変�
 oc-mirctl collect --kubeconfig ~/.kube/config
 ```
 
-出力:
-- `mirror_data/<cluster-name>/current-data.json` — 今回の収集結果のみ。`list` / `generate` のデフォルト入力
-- `mirror_data/<cluster-name>/collected-data.json` — 過去の収集結果との和集合。`list` / `generate` に `--all` を付けたときの入力
+出力: `mirror_data/<cluster-name>/collected-data.json`
 
-アップグレードを繰り返すクラスタでは、累積データに旧バージョンの relatedImages や Pod イメージが残り続ける。
-最新状態だけをミラーしたい場合はデフォルト (current-data.json) を、過去分も含めてミラーしたい場合は `--all` を使う。
+collect はオプションなしで、その時点でクラスタに登録されている情報を **使用中のものも未使用のものも** すべて収集する。
+何を対象にするかの絞り込みは `list` / `generate` 側で行う (デフォルト = 使用中のみ、`--all` = 未使用も含む)。
 
-収集する情報:
+収集する情報 (使用中):
 - OCP バージョン・チャネル・リリースイメージ
 - OCP Platform イメージサイズ (`oc adm release info --size`)
-- 全 Subscription (パッケージ名・チャネル・CatalogSource)
+- 全 Subscription (パッケージ名・チャネル・CatalogSource) と CSV の `spec.version`
 - CSV の `spec.relatedImages` (NVIDIA 等のサードパーティイメージ)
 - 全 CatalogSource とそのインデックスイメージ
 - 全 Pod で使用中のコンテナイメージ
 - 全イメージのサイズ (skopeo)
 
+収集する情報 (未使用、`--all` で対象。ダウングレードへの備え):
+- ClusterVersion の `status.history` に残る過去のリリース
+- InstallPlan に残る、過去にインストールした Operator の版 (その版を含むチャネルも記録)
+- ノードにキャッシュされているが、使用中のもの・リリースに含まれるものではないイメージ
+
+未使用の情報の制約:
+- kubelet はノードの `status.images` にサイズの大きい順で最大 50 件しか載せないため、小さいイメージは検出できない場合がある
+  (上限に達したノードがあると collect が警告する)。ディスク逼迫時の GC で消えたイメージも検出できない
+- InstallPlan は OLM により古いものから削除されるため、古い版は残っていない場合がある
+- OCP 本体のダウングレードは基本的にサポートされない (z-stream 内のロールバックのみ)。ミラーを用意しても戻せるとは限らない
+
 ### 2. list — 収集済みデータを一覧表示
 
 ```bash
-# 全 Operator と relatedImages をサイズ付きで表示 (最新の収集結果のみ)
+# 全 Operator と relatedImages をサイズ付きで表示 (使用中のもののみ)
 oc-mirctl list
 
-# 過去の収集結果も含めて表示
+# 未使用の過去のリリース / Operator の版 / キャッシュ済みイメージも表示
 oc-mirctl list --all
 
 # JSON / YAML 出力
@@ -120,7 +128,7 @@ oc-mirctl include image --match "*rocm*"
 
 ### 4. generate — mirror 用設定ファイルを生成
 
-`current-data.json` (デフォルト) または `collected-data.json` (`--all`) を元に oc-mirror 用の設定を生成する。
+`collected-data.json` を元に oc-mirror 用の設定を生成する。
 
 ```bash
 # ImageSetConfiguration のみ生成 (最新状態のみ、Operator は現行〜チャネル最新)
@@ -129,8 +137,11 @@ oc-mirctl generate
 # Operator を現行バージョンに固定 (次のアップグレード先は含めない)
 oc-mirctl generate --pin-operators
 
-# 過去の収集結果も含めて生成
+# 未使用の過去のリリース / Operator の版 / キャッシュ済みイメージも含めて生成 (ダウングレードへの備え)
 oc-mirctl generate --all
+
+# 組み合わせも可 (過去の版〜現行の範囲に固定)
+oc-mirctl generate --all --pin-operators
 
 # Mirror Registry の URL 指定で disconnected-overrides.yaml も生成
 oc-mirctl generate --mirror-registry mirror.example.com:8443
@@ -151,6 +162,11 @@ ImageSetConfiguration の特徴:
   - デフォルト: defaultChannel をチャネル名のみで追加する (oc-mirror はその head 1 版をミラーする)
   - `--pin-operators`: defaultChannel は追加せず、パッケージの `defaultChannel` を
     Subscription のチャネルで上書きする (余分な版をミラーしない)
+- `--all` のときの追加分
+  - Platform: 過去のリリースをマイナーバージョンごとのチャネル (例: `stable-4.20`) に min/max で追加
+  - Operator: 現チャネルの `minVersion` を最も古くインストールした版に下げる。別チャネルにある過去の版は、
+    そのチャネルをインストールした版の範囲で追加する (カタログから消えた版は警告して除外)
+  - additionalImages: ノードにキャッシュされた未使用イメージを追加
 - 既にミラー済みの古いイメージはレジストリから自動削除されない。不要になったイメージの削除は
   `oc-mirror delete` (DeleteImageSetConfiguration) を別途運用で実施する
 - CatalogSource ごとに Operator をグルーピング (redhat / certified / community)

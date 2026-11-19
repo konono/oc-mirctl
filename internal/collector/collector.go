@@ -29,6 +29,8 @@ type RelatedImage struct {
 
 type OperatorInfo struct {
 	Name           string         `json:"name"`
+	// Namespace は Subscription の namespace (InstallPlan の照合に使う)
+	Namespace      string         `json:"namespace,omitempty"`
 	PackageName    string         `json:"packageName"`
 	Channel        string         `json:"channel"`
 	DefaultChannel string         `json:"defaultChannel,omitempty"`
@@ -39,6 +41,8 @@ type OperatorInfo struct {
 	// CSV 名からの推定 (例: "pkg.v1.2.3" → "v1.2.3") より正確なので generate で優先する。
 	BundleVersion  string         `json:"bundleVersion,omitempty"`
 	RelatedImages  []RelatedImage `json:"relatedImages,omitempty"`
+	// PastVersions は InstallPlan に残る、過去にインストールした版 (古い順、現在の版は含まない)
+	PastVersions   []PastVersion  `json:"pastVersions,omitempty"`
 	LastSeen       string         `json:"lastSeen"`
 }
 
@@ -67,6 +71,11 @@ type Result struct {
 	PodImages        []string       `json:"podImages"`
 	CustomImages     []string       `json:"customImages"`
 	UncoveredImages  []string       `json:"uncoveredImages,omitempty"`
+	// PastReleases は ClusterVersion の history に残る過去のリリース (古い順)
+	PastReleases     []ReleaseEntry `json:"pastReleases,omitempty"`
+	// UnusedImages はノードにキャッシュされているが、使用中のもの・リリースに
+	// 含まれるものを除いたイメージ (過去の版の名残り)
+	UnusedImages     []string       `json:"unusedImages,omitempty"`
 	PrivateRegistries []string          `json:"privateRegistries,omitempty"`
 	PrivateImages     []string          `json:"privateImages,omitempty"`
 	CatalogSources    []CatalogInfo    `json:"catalogSources"`
@@ -104,6 +113,12 @@ func (r *Result) AllImages() []string {
 		}
 	}
 	for _, img := range r.UncoveredImages {
+		if !seen[img] {
+			seen[img] = true
+			images = append(images, img)
+		}
+	}
+	for _, img := range r.UnusedImages {
 		if !seen[img] {
 			seen[img] = true
 			images = append(images, img)
@@ -216,10 +231,36 @@ func (c *Collector) Collect() (*Result, error) {
 	}
 
 	fmt.Println("==> PackageManifest からデフォルトチャネルを取得...")
-	if err := c.enrichWithDefaultChannels(ctx, operators); err != nil {
-		fmt.Printf("    WARN: デフォルトチャネルの取得に一部失敗: %v\n", err)
+	pkgChannels, err := c.getPackageChannels(ctx)
+	if err != nil {
+		fmt.Printf("    WARN: %v\n", err)
+	}
+	enrichWithDefaultChannels(operators, pkgChannels)
+
+	fmt.Println("==> InstallPlan から過去にインストールした Operator の版を取得...")
+	if err := c.enrichWithPastVersions(ctx, operators, pkgChannels); err != nil {
+		fmt.Printf("    WARN: %v\n", err)
+	}
+	for _, op := range operators {
+		for _, pv := range op.PastVersions {
+			ch := pv.Channel
+			if ch == "" {
+				ch = "(カタログに存在しない)"
+			}
+			fmt.Printf("    %s: %s (channel=%s, installed=%s)\n", op.PackageName, pv.Version, ch, pv.InstalledAt)
+		}
 	}
 	result.Operators = operators
+
+	fmt.Println("==> ClusterVersion の履歴から過去のリリースを取得...")
+	if past, err := c.getPastReleases(ctx, version); err != nil {
+		fmt.Printf("    WARN: %v\n", err)
+	} else {
+		result.PastReleases = past
+		for _, r := range past {
+			fmt.Printf("    %s (%s)\n", r.Version, r.State)
+		}
+	}
 
 	fmt.Println("==> CatalogSource を取得...")
 	catalogs, err := c.getCatalogSources(ctx)
@@ -287,7 +328,13 @@ func (c *Collector) Collect() (*Result, error) {
 	}
 
 	fmt.Println("==> Platform イメージ一覧を取得してカバレッジ分析...")
-	result.UncoveredImages = detectUncoveredImages(result, authFile)
+	platformImages, err := GetPlatformImages(result.ReleaseImage, authFile)
+	if err != nil {
+		fmt.Printf("    WARN: platform イメージ一覧の取得に失敗: %v\n", err)
+	} else {
+		fmt.Printf("    Platform images: %d\n", len(platformImages))
+	}
+	result.UncoveredImages = detectUncoveredImages(result, platformImages)
 	if len(result.UncoveredImages) > 0 {
 		fmt.Printf("    ⚠ %d 個の未カバーイメージを検出:\n", len(result.UncoveredImages))
 		for _, img := range result.UncoveredImages {
@@ -295,6 +342,30 @@ func (c *Collector) Collect() (*Result, error) {
 		}
 	} else {
 		fmt.Println("    全 Pod イメージがカバーされています")
+	}
+
+	fmt.Println("==> ノードにキャッシュされた未使用イメージを検出...")
+	nodeImages, truncated, err := c.getNodeImages(ctx)
+	if err != nil {
+		fmt.Printf("    WARN: %v\n", err)
+	} else {
+		// 過去のリリースのイメージも --all で platform としてミラーされるので除外対象に含める
+		coverage := platformImages
+		for _, r := range result.PastReleases {
+			imgs, err := GetPlatformImages(r.Image, authFile)
+			if err != nil {
+				fmt.Printf("    WARN: %s の platform イメージ一覧の取得に失敗: %v\n", r.Version, err)
+				continue
+			}
+			coverage = append(coverage, imgs...)
+		}
+		result.UnusedImages = detectUnusedImages(nodeImages, result, coverage)
+		fmt.Printf("    %d 個の未使用イメージ (list / generate の --all で対象になります)\n", len(result.UnusedImages))
+		if truncated > 0 {
+			fmt.Printf("    WARN: %d ノードが status.images の上限 (%d 件) に達しています。"+
+				"kubelet はサイズの大きい順にしか報告しないため、小さい未使用イメージは検出できない場合があります\n",
+				truncated, nodeStatusMaxImages)
+		}
 	}
 
 	return result, nil
@@ -307,13 +378,7 @@ func (c *Collector) Collect() (*Result, error) {
 // platform イメージは repo 名一致でカバー済みと判定する（リリース全体がミラーされるため）。
 // operator relatedImages は digest の完全一致で判定する（oc-mirror は CSV に記載された
 // 特定の digest のみミラーするため、同じ repo でも異なる digest は未ミラーになる）。
-// DetectUncoveredImages は Pod で使用中のイメージのうち、カバーされていないものを検出する。
-// Merge 後に再計算するために公開する。
-func DetectUncoveredImages(result *Result, authFile string) []string {
-	return detectUncoveredImages(result, authFile)
-}
-
-func detectUncoveredImages(result *Result, authFile string) []string {
+func detectUncoveredImages(result *Result, platformImages []string) []string {
 	// exactCovered: digest 完全一致でカバー済み
 	exactCovered := map[string]bool{}
 
@@ -322,14 +387,8 @@ func detectUncoveredImages(result *Result, authFile string) []string {
 	// repo 名一致は使わない — 同一 repo に異なるコンポーネントが複数あり、
 	// repo 名だけでは無関係な digest までカバー済みと誤判定する。
 	exactCovered[result.ReleaseImage] = true // リリースイメージ自体もカバー済み
-	platformImages, err := GetPlatformImages(result.ReleaseImage, authFile)
-	if err != nil {
-		fmt.Printf("    WARN: platform イメージ一覧の取得に失敗: %v\n", err)
-	} else {
-		fmt.Printf("    Platform images: %d\n", len(platformImages))
-		for _, img := range platformImages {
-			exactCovered[img] = true
-		}
+	for _, img := range platformImages {
+		exactCovered[img] = true
 	}
 
 	// 2. Operator relatedImages — digest 完全一致のみ
@@ -436,6 +495,7 @@ func (c *Collector) getOperatorsFromSubscriptions(ctx context.Context, now strin
 
 		op := OperatorInfo{
 			Name:          sub.GetName(),
+			Namespace:     sub.GetNamespace(),
 			PackageName:   pkg,
 			Channel:       ch,
 			CatalogSource: catSrc,
@@ -492,38 +552,19 @@ func (c *Collector) enrichWithRelatedImages(ctx context.Context, operators []Ope
 	return nil
 }
 
-func (c *Collector) enrichWithDefaultChannels(ctx context.Context, operators []OperatorInfo) error {
-	gvr := schema.GroupVersionResource{Group: "packages.operators.coreos.com", Version: "v1", Resource: "packagemanifests"}
-	pmList, err := c.client.Resource(gvr).Namespace("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("PackageManifest の取得に失敗: %w", err)
-	}
-
-	// 同名パッケージが複数の CatalogSource に存在しうる (例: redhat-operators と
-	// community-operators の両方に同名パッケージ) ため、Subscription の
-	// catalogSource / sourceNamespace と一致する PackageManifest を使う。
-	pmMap := map[string]string{}
-	for _, pm := range pmList.Items {
-		defaultCh, _, _ := unstructured.NestedString(pm.Object, "status", "defaultChannel")
-		if defaultCh == "" {
+// enrichWithDefaultChannels は Subscription と同じカタログの PackageManifest から
+// defaultChannel を設定する (同名パッケージが複数カタログにあっても取り違えない)
+func enrichWithDefaultChannels(operators []OperatorInfo, pkgChannels map[string]*packageChannels) {
+	for i := range operators {
+		pc := pkgChannels[packageKey(operators[i].CatalogNS, operators[i].CatalogSource, operators[i].PackageName)]
+		if pc == nil || pc.defaultChannel == "" {
 			continue
 		}
-		src, _, _ := unstructured.NestedString(pm.Object, "status", "catalogSource")
-		srcNS, _, _ := unstructured.NestedString(pm.Object, "status", "catalogSourceNamespace")
-		pmMap[srcNS+"/"+src+"/"+pm.GetName()] = defaultCh
-	}
-
-	for i := range operators {
-		key := operators[i].CatalogNS + "/" + operators[i].CatalogSource + "/" + operators[i].PackageName
-		if ch, ok := pmMap[key]; ok {
-			operators[i].DefaultChannel = ch
-			if ch != operators[i].Channel {
-				fmt.Printf("    %s: channel=%s, defaultChannel=%s\n", operators[i].PackageName, operators[i].Channel, ch)
-			}
+		operators[i].DefaultChannel = pc.defaultChannel
+		if pc.defaultChannel != operators[i].Channel {
+			fmt.Printf("    %s: channel=%s, defaultChannel=%s\n", operators[i].PackageName, operators[i].Channel, pc.defaultChannel)
 		}
 	}
-
-	return nil
 }
 
 func (c *Collector) getCatalogSources(ctx context.Context) ([]CatalogInfo, error) {
@@ -945,7 +986,7 @@ func mergePullSecrets(globalPS []byte, extras [][]byte) ([]byte, error) {
 	return json.Marshal(result)
 }
 
-// LoadPrevious は既存の collected-data.json を読み込む (マージ用)
+// LoadPrevious は既存の collected-data.json を読み込む
 func LoadPrevious(dir string) (*Result, error) {
 	path := filepath.Join(dir, "collected-data.json")
 	raw, err := os.ReadFile(path)
@@ -957,140 +998,6 @@ func LoadPrevious(dir string) (*Result, error) {
 		return nil, err
 	}
 	return &result, nil
-}
-
-// Merge は old (前回) と new (今回) をマージして新しい Result を返す
-func Merge(old, new *Result) *Result {
-	merged := &Result{
-		ClusterName:       new.ClusterName,
-		ClusterID:         new.ClusterID,
-		OCPVersion:        new.OCPVersion,
-		OCPChannel:        new.OCPChannel,
-		ReleaseImage:      new.ReleaseImage,
-		PlatformImageSize: new.PlatformImageSize,
-		CollectedAt:       new.CollectedAt,
-		pullSecret:        new.pullSecret,
-	}
-
-	// --- Operators: キー = catalogSource/packageName ---
-	merged.Operators = mergeOperators(old.Operators, new.Operators)
-
-	// --- PodImages: 和集合 ---
-	merged.PodImages = mergeStringSlices(old.PodImages, new.PodImages)
-
-	// --- CustomImages: 和集合 ---
-	merged.CustomImages = mergeStringSlices(old.CustomImages, new.CustomImages)
-
-	// --- UncoveredImages: マージ後の PodImages から再計算が必要 ---
-	// Merge 時点では authFile がないため再計算できない。
-	// collect.go 側で RecalculateUncovered を呼ぶ。暫定的に new を使う。
-	merged.UncoveredImages = new.UncoveredImages
-
-	// --- PrivateRegistries / PrivateImages: 和集合 ---
-	merged.PrivateRegistries = mergeStringSlices(old.PrivateRegistries, new.PrivateRegistries)
-	merged.PrivateImages = mergeStringSlices(old.PrivateImages, new.PrivateImages)
-
-	// --- CatalogSources: キー = namespace/name, image は最新 ---
-	merged.CatalogSources = mergeCatalogSources(old.CatalogSources, new.CatalogSources)
-
-	return merged
-}
-
-func mergeOperators(old, new []OperatorInfo) []OperatorInfo {
-	index := map[string]*OperatorInfo{}
-
-	// old を先にインデックスに入れる
-	for i := range old {
-		op := old[i]
-		index[op.Key()] = &op
-	}
-
-	// new で上書き or 追加
-	for i := range new {
-		op := new[i]
-		key := op.Key()
-
-		if existing, ok := index[key]; ok {
-			// 同一キー: channel, version は最新を採用
-			existing.Channel = op.Channel
-			existing.DefaultChannel = op.DefaultChannel
-			existing.Version = op.Version
-			existing.BundleVersion = op.BundleVersion
-			existing.Name = op.Name
-			existing.CatalogNS = op.CatalogNS
-			existing.LastSeen = op.LastSeen
-
-			// relatedImages は和集合 (image をキーにマージ)
-			existing.RelatedImages = mergeRelatedImages(existing.RelatedImages, op.RelatedImages)
-		} else {
-			// 新規追加
-			index[key] = &op
-		}
-	}
-
-	// old のみに存在するもの: 保持 (lastSeen は更新しない = 前回のまま)
-
-	var result []OperatorInfo
-	for _, op := range index {
-		result = append(result, *op)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].PackageName < result[j].PackageName })
-	return result
-}
-
-func mergeCatalogSources(old, new []CatalogInfo) []CatalogInfo {
-	index := map[string]*CatalogInfo{}
-
-	for i := range old {
-		cs := old[i]
-		index[cs.Key()] = &cs
-	}
-
-	for i := range new {
-		cs := new[i]
-		// 既存は最新の image で上書き、新規は追加
-		index[cs.Key()] = &cs
-	}
-
-	var result []CatalogInfo
-	for _, cs := range index {
-		result = append(result, *cs)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
-	return result
-}
-
-func mergeRelatedImages(old, new []RelatedImage) []RelatedImage {
-	index := map[string]RelatedImage{}
-	for _, ri := range old {
-		index[ri.Image] = ri
-	}
-	for _, ri := range new {
-		index[ri.Image] = ri
-	}
-	var result []RelatedImage
-	for _, ri := range index {
-		result = append(result, ri)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Image < result[j].Image })
-	return result
-}
-
-func mergeStringSlices(a, b []string) []string {
-	set := map[string]bool{}
-	for _, s := range a {
-		set[s] = true
-	}
-	for _, s := range b {
-		set[s] = true
-	}
-
-	var result []string
-	for s := range set {
-		result = append(result, s)
-	}
-	sort.Strings(result)
-	return result
 }
 
 func (r *Result) Save(dir string) error {

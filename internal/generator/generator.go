@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"sigs.k8s.io/yaml"
@@ -30,9 +31,10 @@ type Generator struct {
 
 // Options は ImageSetConfiguration 生成の挙動を制御する
 type Options struct {
-	// DataFile は outputDir 配下の入力データファイル名
-	// (current-data.json = 最新状態のみ / collected-data.json = 累積)
-	DataFile string
+	// All が true の場合、collect 時点でクラスタに残っている未使用の情報
+	// (過去のリリース、過去にインストールした Operator の版、ノードにキャッシュされた
+	// 未使用イメージ) も対象に含める。false の場合は使用中のものだけを対象にする。
+	All bool
 	// PinOperators が true の場合、Operator を現行 CSV のバージョンに固定する
 	// (maxVersion = minVersion)。false の場合は現行〜チャネル最新をミラーする。
 	//
@@ -50,7 +52,22 @@ type CollectedData struct {
 	Operators      []OperatorInfo  `json:"operators"`
 	CustomImages    []string        `json:"customImages"`
 	UncoveredImages []string        `json:"uncoveredImages"`
+	PastReleases    []ReleaseEntry  `json:"pastReleases"`
+	UnusedImages    []string        `json:"unusedImages"`
 	CatalogSources  []CatalogSource `json:"catalogSources"`
+}
+
+// ReleaseEntry は ClusterVersion の履歴に残る過去のリリース
+type ReleaseEntry struct {
+	Version string `json:"version"`
+	Image   string `json:"image"`
+}
+
+// PastVersion は InstallPlan に残る、過去にインストールした Operator の版 (古い順)
+type PastVersion struct {
+	CSV     string `json:"csv"`
+	Version string `json:"version"`
+	Channel string `json:"channel"`
 }
 
 type RelatedImage struct {
@@ -67,6 +84,7 @@ type OperatorInfo struct {
 	CatalogSource  string         `json:"catalogSource"`
 	CatalogNS      string         `json:"catalogNamespace"`
 	RelatedImages []RelatedImage `json:"relatedImages"`
+	PastVersions  []PastVersion  `json:"pastVersions"`
 }
 
 type CatalogSource struct {
@@ -139,18 +157,15 @@ type ImageDigestSource struct {
 }
 
 func New(outputDir, mirrorRegistry string, opts Options) (*Generator, error) {
-	if opts.DataFile == "" {
-		opts.DataFile = "collected-data.json"
-	}
-	dataFile := filepath.Join(outputDir, opts.DataFile)
+	dataFile := filepath.Join(outputDir, "collected-data.json")
 	raw, err := os.ReadFile(dataFile)
 	if err != nil {
-		return nil, fmt.Errorf("%s の読み込みに失敗: %w", opts.DataFile, err)
+		return nil, fmt.Errorf("collected-data.json の読み込みに失敗: %w", err)
 	}
 
 	var data CollectedData
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, fmt.Errorf("%s のパースに失敗: %w", opts.DataFile, err)
+		return nil, fmt.Errorf("collected-data.json のパースに失敗: %w", err)
 	}
 
 	// exclusions を読み込み (なければ空)
@@ -202,20 +217,13 @@ func (g *Generator) GenerateImageSetConfig() error {
 
 		pkg := PkgConfig{Name: op.PackageName}
 		if op.Channel != "" {
-			ch := PkgChannelRef{Name: op.Channel}
-			if v := operatorVersion(op); v != "" {
-				ch.MinVersion = v
-				if g.opts.PinOperators {
-					ch.MaxVersion = v
-				}
-			}
-			pkg.Channels = []PkgChannelRef{ch}
+			pkg.Channels = g.operatorChannels(op)
 			if op.DefaultChannel != "" && op.DefaultChannel != op.Channel {
 				if g.opts.PinOperators {
 					// defaultChannel の head を余分にミラーしないよう、
 					// フィルタ済みカタログの defaultChannel を Subscription のチャネルにする
 					pkg.DefaultChannel = op.Channel
-				} else {
+				} else if !hasChannel(pkg.Channels, op.DefaultChannel) {
 					pkg.Channels = append(pkg.Channels, PkgChannelRef{Name: op.DefaultChannel})
 				}
 			}
@@ -264,12 +272,8 @@ func (g *Generator) GenerateImageSetConfig() error {
 		APIVersion: "mirror.openshift.io/v2alpha1",
 		Mirror: MirrorConfig{
 			Platform: PlatformConfig{
-				Channels: []ChannelConfig{{
-					Name:       channel,
-					MinVersion: g.data.OCPVersion,
-					MaxVersion: g.data.OCPVersion,
-					}},
-				Graph: true,
+				Channels: g.platformChannels(channel),
+				Graph:    true,
 			},
 			Operators: operatorCatalogs,
 		},
@@ -289,6 +293,11 @@ func (g *Generator) GenerateImageSetConfig() error {
 	}
 	for _, img := range g.data.UncoveredImages {
 		additionalSet[img] = true
+	}
+	if g.opts.All {
+		for _, img := range g.data.UnusedImages {
+			additionalSet[img] = true
+		}
 	}
 	var untagged []string
 	for img := range additionalSet {
@@ -352,6 +361,233 @@ func (g *Generator) GenerateDisconnectedOverrides() error {
 	path := filepath.Join(g.outputDir, "disconnected-overrides.yaml")
 	fmt.Printf("==> %s を生成\n", path)
 	return os.WriteFile(path, out, 0644)
+}
+
+// operatorChannels は Operator のチャネル指定を返す。
+//
+// Subscription のチャネルは現行の版を minVersion にする (--pin-operators では maxVersion も)。
+// --all では、InstallPlan に残る過去の版も含むよう範囲を広げる:
+//   - Subscription のチャネル → 現行の版と過去の版のうち最も低い版を minVersion
+//     (--pin-operators では最も高い版を maxVersion) にする
+//   - 別のチャネルにある過去の版 → そのチャネルを、過去の版の最低〜最高の範囲で追加する
+//
+// 範囲はインストール順ではなくバージョンの大小で決める (ダウングレードを含む履歴でも
+// minVersion > maxVersion にならないように)。
+func (g *Generator) operatorChannels(op OperatorInfo) []PkgChannelRef {
+	cur := operatorVersion(op)
+	ch := PkgChannelRef{Name: op.Channel}
+	if cur != "" {
+		ch.MinVersion = cur
+		if g.opts.PinOperators {
+			ch.MaxVersion = cur
+		}
+	}
+	channels := []PkgChannelRef{ch}
+	if !g.opts.All || cur == "" {
+		return channels
+	}
+
+	// 過去の版をチャネルごとにまとめ、バージョンの大小で下限・上限を求める
+	type versionRange struct{ min, max string }
+	widen := func(r *versionRange, v string) {
+		if compareVersions(v, r.min) < 0 {
+			r.min = v
+		}
+		if compareVersions(v, r.max) > 0 {
+			r.max = v
+		}
+	}
+	ranges := map[string]*versionRange{op.Channel: {min: cur, max: cur}}
+	var order []string
+	for _, pv := range op.PastVersions {
+		if pv.Version == "" {
+			continue
+		}
+		if pv.Channel == "" {
+			fmt.Printf("    WARN: %s %s はカタログに存在しないためミラーできません\n", op.PackageName, pv.Version)
+			continue
+		}
+		r, ok := ranges[pv.Channel]
+		if !ok {
+			ranges[pv.Channel] = &versionRange{min: pv.Version, max: pv.Version}
+			order = append(order, pv.Channel)
+			continue
+		}
+		widen(r, pv.Version)
+	}
+
+	cr := ranges[op.Channel]
+	channels[0].MinVersion = cr.min
+	if g.opts.PinOperators {
+		channels[0].MaxVersion = cr.max
+	}
+	for _, name := range order {
+		r := ranges[name]
+		channels = append(channels, PkgChannelRef{Name: name, MinVersion: r.min, MaxVersion: r.max})
+	}
+	return channels
+}
+
+func hasChannel(channels []PkgChannelRef, name string) bool {
+	for _, ch := range channels {
+		if ch.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// platformChannels は platform のチャネル指定を返す。デフォルトは現在の版のみ。
+// --all では ClusterVersion の履歴に残る過去のリリースも、マイナーバージョンごとの
+// チャネル (例: stable-4.20) に min/max で含める。現在のマイナーは現在のチャネルを使う。
+func (g *Generator) platformChannels(channel string) []ChannelConfig {
+	cur := ChannelConfig{Name: channel, MinVersion: g.data.OCPVersion, MaxVersion: g.data.OCPVersion}
+	if !g.opts.All || len(g.data.PastReleases) == 0 {
+		return []ChannelConfig{cur}
+	}
+
+	prefix := "stable"
+	if i := strings.LastIndex(channel, "-"); i > 0 {
+		prefix = channel[:i]
+	}
+	curMinor := minorOf(g.data.OCPVersion)
+
+	byMinor := map[string]*ChannelConfig{curMinor: &cur}
+	order := []string{}
+	for _, r := range g.data.PastReleases {
+		minor := minorOf(r.Version)
+		if minor == "" {
+			continue
+		}
+		c, ok := byMinor[minor]
+		if !ok {
+			c = &ChannelConfig{Name: prefix + "-" + minor, MinVersion: r.Version, MaxVersion: r.Version}
+			byMinor[minor] = c
+			order = append(order, minor)
+			continue
+		}
+		if compareVersions(r.Version, c.MinVersion) < 0 {
+			c.MinVersion = r.Version
+		}
+		if compareVersions(r.Version, c.MaxVersion) > 0 {
+			c.MaxVersion = r.Version
+		}
+	}
+	sort.Slice(order, func(i, j int) bool { return compareVersions(order[i], order[j]) < 0 })
+
+	var channels []ChannelConfig
+	for _, minor := range order {
+		channels = append(channels, *byMinor[minor])
+	}
+	return append(channels, *byMinor[curMinor])
+}
+
+// minorOf は "4.22.21" から "4.22" を返す
+func minorOf(version string) string {
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[0] + "." + parts[1]
+}
+
+// compareVersions は semver 形式のバージョンを比較する。
+// 数値部分 (major.minor.patch...) を比べ、同じならプレリリース部分を semver の規則で比べる
+// (プレリリース無し > あり、識別子は数値なら数値、それ以外は文字列として比較)。
+// ビルドメタデータ (+ 以降) は無視する。先頭の "v" は許容する。
+func compareVersions(a, b string) int {
+	a, b = strings.TrimPrefix(a, "v"), strings.TrimPrefix(b, "v")
+	if c := compareNumbers(versionNumbers(a), versionNumbers(b)); c != 0 {
+		return c
+	}
+	return comparePrerelease(prereleaseOf(a), prereleaseOf(b))
+}
+
+func compareNumbers(pa, pb []int) int {
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		var x, y int
+		if i < len(pa) {
+			x = pa[i]
+		}
+		if i < len(pb) {
+			y = pb[i]
+		}
+		if x != y {
+			if x < y {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+func prereleaseOf(v string) string {
+	if i := strings.Index(v, "+"); i >= 0 {
+		v = v[:i]
+	}
+	if i := strings.Index(v, "-"); i >= 0 {
+		return v[i+1:]
+	}
+	return ""
+}
+
+func comparePrerelease(a, b string) int {
+	switch {
+	case a == b:
+		return 0
+	case a == "":
+		return 1
+	case b == "":
+		return -1
+	}
+	ia, ib := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(ia) && i < len(ib); i++ {
+		na, errA := strconv.Atoi(ia[i])
+		nb, errB := strconv.Atoi(ib[i])
+		switch {
+		case errA == nil && errB == nil:
+			if na != nb {
+				if na < nb {
+					return -1
+				}
+				return 1
+			}
+		case errA == nil:
+			return -1 // 数値の識別子は文字列より小さい
+		case errB == nil:
+			return 1
+		default:
+			if c := strings.Compare(ia[i], ib[i]); c != 0 {
+				return c
+			}
+		}
+	}
+	switch {
+	case len(ia) < len(ib):
+		return -1
+	case len(ia) > len(ib):
+		return 1
+	}
+	return 0
+}
+
+func versionNumbers(v string) []int {
+	if i := strings.IndexAny(v, "-+"); i >= 0 {
+		v = v[:i]
+	}
+	var nums []int
+	for _, p := range strings.Split(v, ".") {
+		n := 0
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				break
+			}
+			n = n*10 + int(c-'0')
+		}
+		nums = append(nums, n)
+	}
+	return nums
 }
 
 // defaultCatalogIndexes は OpenShift のデフォルト CatalogSource 名とインデックスイメージの対応
