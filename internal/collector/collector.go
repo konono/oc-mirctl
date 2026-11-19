@@ -35,6 +35,9 @@ type OperatorInfo struct {
 	CatalogSource  string         `json:"catalogSource"`
 	CatalogNS      string         `json:"catalogNamespace"`
 	Version        string         `json:"version"`
+	// BundleVersion は CSV の spec.version (bundle の semver)。
+	// CSV 名からの推定 (例: "pkg.v1.2.3" → "v1.2.3") より正確なので generate で優先する。
+	BundleVersion  string         `json:"bundleVersion,omitempty"`
 	RelatedImages  []RelatedImage `json:"relatedImages,omitempty"`
 	LastSeen       string         `json:"lastSeen"`
 }
@@ -467,6 +470,10 @@ func (c *Collector) enrichWithRelatedImages(ctx context.Context, operators []Ope
 			continue
 		}
 
+		if v, _, _ := unstructured.NestedString(csv.Object, "spec", "version"); v != "" {
+			operators[i].BundleVersion = v
+		}
+
 		relatedImages, _, _ := unstructured.NestedSlice(csv.Object, "spec", "relatedImages")
 		for _, ri := range relatedImages {
 			if riMap, ok := ri.(map[string]interface{}); ok {
@@ -492,17 +499,23 @@ func (c *Collector) enrichWithDefaultChannels(ctx context.Context, operators []O
 		return fmt.Errorf("PackageManifest の取得に失敗: %w", err)
 	}
 
+	// 同名パッケージが複数の CatalogSource に存在しうる (例: redhat-operators と
+	// community-operators の両方に同名パッケージ) ため、Subscription の
+	// catalogSource / sourceNamespace と一致する PackageManifest を使う。
 	pmMap := map[string]string{}
 	for _, pm := range pmList.Items {
-		name := pm.GetName()
 		defaultCh, _, _ := unstructured.NestedString(pm.Object, "status", "defaultChannel")
-		if defaultCh != "" {
-			pmMap[name] = defaultCh
+		if defaultCh == "" {
+			continue
 		}
+		src, _, _ := unstructured.NestedString(pm.Object, "status", "catalogSource")
+		srcNS, _, _ := unstructured.NestedString(pm.Object, "status", "catalogSourceNamespace")
+		pmMap[srcNS+"/"+src+"/"+pm.GetName()] = defaultCh
 	}
 
 	for i := range operators {
-		if ch, ok := pmMap[operators[i].PackageName]; ok {
+		key := operators[i].CatalogNS + "/" + operators[i].CatalogSource + "/" + operators[i].PackageName
+		if ch, ok := pmMap[key]; ok {
 			operators[i].DefaultChannel = ch
 			if ch != operators[i].Channel {
 				fmt.Printf("    %s: channel=%s, defaultChannel=%s\n", operators[i].PackageName, operators[i].Channel, ch)
@@ -541,8 +554,9 @@ func (c *Collector) getPodImages(ctx context.Context) ([]string, error) {
 
 	imageSet := map[string]bool{}
 	for _, pod := range podList.Items {
-		extractImages(pod.Object, "containers", imageSet)
-		extractImages(pod.Object, "initContainers", imageSet)
+		for _, img := range podContainerImages(pod.Object) {
+			imageSet[img] = true
+		}
 	}
 
 	var images []string
@@ -553,15 +567,76 @@ func (c *Collector) getPodImages(ctx context.Context) ([]string, error) {
 	return images, nil
 }
 
-func extractImages(obj map[string]interface{}, field string, imageSet map[string]bool) {
-	containers, _, _ := unstructured.NestedSlice(obj, "spec", field)
-	for _, c := range containers {
-		if cMap, ok := c.(map[string]interface{}); ok {
-			if img, ok := cMap["image"].(string); ok && img != "" {
-				imageSet[img] = true
+// podContainerImages は Pod の containers / initContainers のイメージ参照を返す。
+//
+// タグも digest も無い参照 (例: "registry.access.redhat.com/ubi9/ubi-minimal") は
+// oc-mirror が "tag and digest are empty" で拒否するため、実際に起動している
+// イメージの digest (status の imageID) で置き換える。imageID が取れない場合
+// (Pod が未起動等) は kubelet と同じ解釈で ":latest" を補う。
+func podContainerImages(pod map[string]interface{}) []string {
+	imageIDs := map[string]string{}
+	for _, field := range []string{"containerStatuses", "initContainerStatuses"} {
+		statuses, _, _ := unstructured.NestedSlice(pod, "status", field)
+		for _, st := range statuses {
+			if m, ok := st.(map[string]interface{}); ok {
+				name, _ := m["name"].(string)
+				id, _ := m["imageID"].(string)
+				if name != "" && id != "" {
+					imageIDs[field+"/"+name] = id
+				}
 			}
 		}
 	}
+
+	var images []string
+	for _, f := range []struct{ spec, status string }{
+		{"containers", "containerStatuses"},
+		{"initContainers", "initContainerStatuses"},
+	} {
+		containers, _, _ := unstructured.NestedSlice(pod, "spec", f.spec)
+		for _, c := range containers {
+			cMap, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			img, _ := cMap["image"].(string)
+			if img == "" {
+				continue
+			}
+			name, _ := cMap["name"].(string)
+			images = append(images, resolvePodImageRef(img, imageIDs[f.status+"/"+name]))
+		}
+	}
+	return images
+}
+
+// resolvePodImageRef はタグも digest も無いイメージ参照を、imageID の digest
+// または ":latest" 付きの参照に変換する。タグか digest があればそのまま返す。
+func resolvePodImageRef(img, imageID string) string {
+	if hasTagOrDigest(img) {
+		return img
+	}
+	id := imageID
+	for _, prefix := range []string{"docker-pullable://", "docker://"} {
+		id = strings.TrimPrefix(id, prefix)
+	}
+	if strings.Contains(id, "@sha256:") {
+		return id
+	}
+	return img + ":latest"
+}
+
+// hasTagOrDigest はイメージ参照にタグか digest が含まれるかを判定する。
+// レジストリの host:port を誤ってタグと判定しないよう、最後の "/" 以降のみを見る。
+func hasTagOrDigest(img string) bool {
+	if strings.Contains(img, "@") {
+		return true
+	}
+	last := img
+	if i := strings.LastIndex(img, "/"); i >= 0 {
+		last = img[i+1:]
+	}
+	return strings.Contains(last, ":")
 }
 
 func filterCustomImages(images []string) []string {
@@ -685,21 +760,8 @@ func (c *Collector) collectPrivateRegistryAuth(ctx context.Context) *privateRegi
 
 		// この Pod のイメージを収集
 		podImgs := map[string]bool{}
-		containers, _, _ := unstructured.NestedSlice(pod.Object, "spec", "containers")
-		for _, c := range containers {
-			if cMap, ok := c.(map[string]interface{}); ok {
-				if img, ok := cMap["image"].(string); ok && img != "" {
-					podImgs[img] = true
-				}
-			}
-		}
-		initContainers, _, _ := unstructured.NestedSlice(pod.Object, "spec", "initContainers")
-		for _, c := range initContainers {
-			if cMap, ok := c.(map[string]interface{}); ok {
-				if img, ok := cMap["image"].(string); ok && img != "" {
-					podImgs[img] = true
-				}
-			}
+		for _, img := range podContainerImages(pod.Object) {
+			podImgs[img] = true
 		}
 
 		for _, ref := range ips {
@@ -953,6 +1015,7 @@ func mergeOperators(old, new []OperatorInfo) []OperatorInfo {
 			existing.Channel = op.Channel
 			existing.DefaultChannel = op.DefaultChannel
 			existing.Version = op.Version
+			existing.BundleVersion = op.BundleVersion
 			existing.Name = op.Name
 			existing.CatalogNS = op.CatalogNS
 			existing.LastSeen = op.LastSeen

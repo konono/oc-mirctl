@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"sigs.k8s.io/yaml"
@@ -34,6 +35,11 @@ type Options struct {
 	DataFile string
 	// PinOperators が true の場合、Operator を現行 CSV のバージョンに固定する
 	// (maxVersion = minVersion)。false の場合は現行〜チャネル最新をミラーする。
+	//
+	// Subscription のチャネルが defaultChannel と異なる場合、true では
+	// defaultChannel をミラー対象に含めず、フィルタ済みカタログの defaultChannel を
+	// Subscription のチャネルで上書きする。false では従来どおり defaultChannel を
+	// チャネル名のみで追加する (oc-mirror はその head 1 版をミラーする)。
 	PinOperators bool
 }
 
@@ -57,6 +63,7 @@ type OperatorInfo struct {
 	Channel        string         `json:"channel"`
 	DefaultChannel string         `json:"defaultChannel"`
 	Version        string         `json:"version"`
+	BundleVersion  string         `json:"bundleVersion"`
 	CatalogSource  string         `json:"catalogSource"`
 	CatalogNS      string         `json:"catalogNamespace"`
 	RelatedImages []RelatedImage `json:"relatedImages"`
@@ -100,8 +107,12 @@ type OperatorCatalog struct {
 }
 
 type PkgConfig struct {
-	Name     string          `json:"name"`
-	Channels []PkgChannelRef `json:"channels,omitempty"`
+	Name string `json:"name"`
+	// DefaultChannel は oc-mirror が生成するフィルタ済みカタログ内の
+	// defaultChannel を上書きする。フィルタ後に元の defaultChannel が
+	// 残らない場合、oc-mirror は上書き指定がないとエラーにする。
+	DefaultChannel string          `json:"defaultChannel,omitempty"`
+	Channels       []PkgChannelRef `json:"channels,omitempty"`
 }
 
 type PkgChannelRef struct {
@@ -191,17 +202,22 @@ func (g *Generator) GenerateImageSetConfig() error {
 
 		pkg := PkgConfig{Name: op.PackageName}
 		if op.Channel != "" {
-			channelSet := map[string]bool{op.Channel: true}
 			ch := PkgChannelRef{Name: op.Channel}
-			if op.Version != "" {
-				ch.MinVersion = extractVersion(op.Version, op.PackageName)
+			if v := operatorVersion(op); v != "" {
+				ch.MinVersion = v
 				if g.opts.PinOperators {
-					ch.MaxVersion = ch.MinVersion
+					ch.MaxVersion = v
 				}
 			}
 			pkg.Channels = []PkgChannelRef{ch}
-			if op.DefaultChannel != "" && !channelSet[op.DefaultChannel] {
-				pkg.Channels = append(pkg.Channels, PkgChannelRef{Name: op.DefaultChannel})
+			if op.DefaultChannel != "" && op.DefaultChannel != op.Channel {
+				if g.opts.PinOperators {
+					// defaultChannel の head を余分にミラーしないよう、
+					// フィルタ済みカタログの defaultChannel を Subscription のチャネルにする
+					pkg.DefaultChannel = op.Channel
+				} else {
+					pkg.Channels = append(pkg.Channels, PkgChannelRef{Name: op.DefaultChannel})
+				}
 			}
 		}
 		catalogPackages[op.CatalogSource] = append(catalogPackages[op.CatalogSource], pkg)
@@ -211,15 +227,22 @@ func (g *Generator) GenerateImageSetConfig() error {
 	}
 
 	var operatorCatalogs []OperatorCatalog
-	for catName, pkgs := range catalogPackages {
+	catNames := make([]string, 0, len(catalogPackages))
+	for catName := range catalogPackages {
+		catNames = append(catNames, catName)
+	}
+	sort.Strings(catNames)
+	for _, catName := range catNames {
+		pkgs := catalogPackages[catName]
 		catImage := catalogImages[catName]
 		if catImage == "" {
-			parts := strings.SplitN(g.data.OCPVersion, ".", 3)
-			minor := "4.22"
-			if len(parts) >= 2 {
-				minor = parts[0] + "." + parts[1]
+			// spec.image を持たない CatalogSource (address 指定の gRPC 等)。
+			// デフォルトカタログなら名前から対応するインデックスを決める。
+			img, err := defaultCatalogIndex(catName, g.data.OCPVersion)
+			if err != nil {
+				return err
 			}
-			catImage = "registry.redhat.io/redhat/redhat-operator-index:v" + minor
+			catImage = img
 		}
 		operatorCatalogs = append(operatorCatalogs, OperatorCatalog{
 			Catalog:  catImage,
@@ -267,11 +290,28 @@ func (g *Generator) GenerateImageSetConfig() error {
 	for _, img := range g.data.UncoveredImages {
 		additionalSet[img] = true
 	}
+	var untagged []string
 	for img := range additionalSet {
 		if excludedImgs[img] {
 			continue
 		}
+		// タグも digest も無い参照は oc-mirror が拒否する。collect は imageID の digest で
+		// 解決するが、修正前に collect した累積データ (--all) には残っている場合がある。
+		if !hasTagOrDigest(img) {
+			untagged = append(untagged, img)
+			img += ":latest"
+		}
 		config.Mirror.AdditionalImages = append(config.Mirror.AdditionalImages, ImageRef{Name: img})
+	}
+	sort.Slice(config.Mirror.AdditionalImages, func(i, j int) bool {
+		return config.Mirror.AdditionalImages[i].Name < config.Mirror.AdditionalImages[j].Name
+	})
+	if len(untagged) > 0 {
+		sort.Strings(untagged)
+		fmt.Printf("    WARN: タグも digest も無いイメージに :latest を補いました (collect は実行中の digest で解決しますが、--all の累積データには以前の参照が残る場合があります):\n")
+		for _, img := range untagged {
+			fmt.Printf("      - %s\n", img)
+		}
 	}
 
 	out, err := yaml.Marshal(config)
@@ -314,6 +354,42 @@ func (g *Generator) GenerateDisconnectedOverrides() error {
 	return os.WriteFile(path, out, 0644)
 }
 
+// defaultCatalogIndexes は OpenShift のデフォルト CatalogSource 名とインデックスイメージの対応
+var defaultCatalogIndexes = map[string]string{
+	"redhat-operators":    "registry.redhat.io/redhat/redhat-operator-index",
+	"certified-operators": "registry.redhat.io/redhat/certified-operator-index",
+	"community-operators": "registry.redhat.io/redhat/community-operator-index",
+	"redhat-marketplace":  "registry.redhat.io/redhat/redhat-marketplace-index",
+}
+
+// defaultCatalogIndex は spec.image を持たない CatalogSource のインデックスイメージを返す。
+// デフォルトカタログ以外は推測せずエラーにする (誤ったカタログに割り当てると
+// oc-mirror がパッケージを見つけられず、Operator がミラーされないため)。
+func defaultCatalogIndex(catName, ocpVersion string) (string, error) {
+	repo, ok := defaultCatalogIndexes[catName]
+	if !ok {
+		return "", fmt.Errorf("CatalogSource %q のインデックスイメージが不明です (spec.image が空)。"+
+			"該当 Operator を exclude するか、collected-data.json の catalogSources に image を設定してください", catName)
+	}
+	parts := strings.SplitN(ocpVersion, ".", 3)
+	if len(parts) < 2 {
+		return "", fmt.Errorf("OCP バージョン %q からカタログのタグを決められません", ocpVersion)
+	}
+	return repo + ":v" + parts[0] + "." + parts[1], nil
+}
+
+// operatorVersion は minVersion / maxVersion に使うバージョンを返す。
+// CSV の spec.version (BundleVersion) を優先し、無い場合 (旧データ) は CSV 名から推定する。
+func operatorVersion(op OperatorInfo) string {
+	if op.BundleVersion != "" {
+		return op.BundleVersion
+	}
+	if op.Version != "" {
+		return extractVersion(op.Version, op.PackageName)
+	}
+	return ""
+}
+
 // extractVersion は CSV 名からバージョン部分を抽出する
 // 例: "rhods-operator.3.5.1" → "3.5.1"
 //     "authorino-operator.v1.4.3" → "v1.4.3"
@@ -330,6 +406,19 @@ func extractVersion(csvName, packageName string) string {
 		return csvName[idx+1:]
 	}
 	return csvName
+}
+
+// hasTagOrDigest はイメージ参照にタグか digest が含まれるかを判定する。
+// レジストリの host:port を誤ってタグと判定しないよう、最後の "/" 以降のみを見る。
+func hasTagOrDigest(img string) bool {
+	if strings.Contains(img, "@") {
+		return true
+	}
+	last := img
+	if i := strings.LastIndex(img, "/"); i >= 0 {
+		last = img[i+1:]
+	}
+	return strings.Contains(last, ":")
 }
 
 func isCustomImage(img string) bool {

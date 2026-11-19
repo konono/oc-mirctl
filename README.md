@@ -143,12 +143,22 @@ oc-mirctl generate --mirror-registry mirror.example.com:8443
 ImageSetConfiguration の特徴:
 - Subscription から正確にパッケージ名・チャネルを取得
 - 各 Operator に `minVersion` を設定し、古いバージョンの不要なイメージを除外
+  - バージョンは CSV の `spec.version` を使う (旧データでは CSV 名から推定)
   - デフォルト: `minVersion` のみ (現行〜チャネル最新。アップグレード先も事前にミラーできる)
   - `--pin-operators`: `minVersion = maxVersion` (現行バージョンのみ。容量を最小化)
+- Subscription のチャネルがパッケージの defaultChannel と異なる場合の扱い
+  - oc-mirror はフィルタ後のカタログに defaultChannel が残らないとエラーにする
+  - デフォルト: defaultChannel をチャネル名のみで追加する (oc-mirror はその head 1 版をミラーする)
+  - `--pin-operators`: defaultChannel は追加せず、パッケージの `defaultChannel` を
+    Subscription のチャネルで上書きする (余分な版をミラーしない)
 - 既にミラー済みの古いイメージはレジストリから自動削除されない。不要になったイメージの削除は
   `oc-mirror delete` (DeleteImageSetConfiguration) を別途運用で実施する
 - CatalogSource ごとに Operator をグルーピング (redhat / certified / community)
+  - `spec.image` を持たない CatalogSource は、デフォルトカタログ名から対応するインデックスを使う
+    (例: `certified-operators` → `certified-operator-index:v<OCP minor>`)。
+    それ以外のカタログで image が不明な場合はエラーにする
 - relatedImages + Pod イメージからサードパーティイメージを自動収集
+  - タグも digest も無い Pod イメージは、collect 時に実行中の digest (status の imageID) で解決する
 
 ### 5. mirror — oc-mirror を実行
 
