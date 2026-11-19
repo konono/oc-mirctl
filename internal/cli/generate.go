@@ -3,7 +3,7 @@ package cli
 import (
 	"fmt"
 
-	"github.com/nict-ocpai/oc-mirctl/internal/generator"
+	"github.com/konono/oc-mirctl/internal/generator"
 	"github.com/spf13/cobra"
 )
 

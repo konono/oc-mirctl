@@ -3,7 +3,7 @@ package cli
 import (
 	"fmt"
 
-	"github.com/nict-ocpai/oc-mirctl/internal/applier"
+	"github.com/konono/oc-mirctl/internal/applier"
 	"github.com/spf13/cobra"
 )
 

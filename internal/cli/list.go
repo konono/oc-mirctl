@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/nict-ocpai/oc-mirctl/internal/collector"
+	"github.com/konono/oc-mirctl/internal/collector"
 	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 	"sigs.k8s.io/yaml"

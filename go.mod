@@ -1,4 +1,4 @@
-module github.com/nict-ocpai/oc-mirctl
+module github.com/konono/oc-mirctl
 
 go 1.23
 

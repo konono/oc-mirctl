@@ -4,6 +4,17 @@
 
 ## Install
 
+### go install
+
+```bash
+go install github.com/konono/oc-mirctl/cmd/oc-mirctl@latest
+# → $(go env GOPATH)/bin/oc-mirctl (GOBIN を設定している場合はそこ)
+```
+
+`oc-mirctl --version` には、モジュールのバージョン (タグが無い場合は `v0.0.0-<時刻>-<コミット>` 形式) が表示される。
+
+### ソースからビルド
+
 ```bash
 make build
 # → bin/oc-mirctl
