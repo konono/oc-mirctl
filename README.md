@@ -50,7 +50,7 @@ mirror_data/                          # 固定ベースディレクトリ (変�
 
 ### 1. collect — クラスタから情報を収集
 
-稼働中のクラスタに接続し、Subscription / CSV / CatalogSource / Pod イメージを収集する。
+稼働中のクラスタに接続し、Subscription / CSV / CatalogSource / Pod イメージ / ワークロード定義などを収集する。
 イメージサイズと OCP Platform サイズも同時に取得する。
 
 ```bash
@@ -74,7 +74,8 @@ collect はオプションなしで、その時点でクラスタに登録され
 - 全 Subscription (パッケージ名・チャネル・CatalogSource) と CSV の `spec.version`
 - CSV の `spec.relatedImages` (NVIDIA 等のサードパーティイメージ)
 - 全 CatalogSource とそのインデックスイメージ
-- 全 Pod で使用中のコンテナイメージ
+- 動いている Pod のコンテナイメージ (完了済み = `Succeeded` / `Failed` の Pod は除く)
+- 全イメージのサイズ (skopeo)
 
 収集する情報 (待機中のワークロード、デフォルトで対象・`--running-only` で除外):
 - Deployment / StatefulSet / DaemonSet / Job / CronJob / DeploymentConfig の Pod テンプレートが参照するが、
@@ -82,8 +83,8 @@ collect はオプションなしで、その時点でクラスタに登録され
   対象ノードの無い DaemonSet)。disconnected 環境では、ミラーしていないとスケールアップやノード追加の時点で
   `ImagePullBackOff` になるため、デフォルトで含める
 - platform / Operator の relatedImages でカバーされるもの、内部レジストリのイメージは除く
+- 完了済みの Job / CronJob の Pod が使っていたイメージは、Job / CronJob の定義からここに含まれる
 - タグも digest も無い参照は、実行中の digest が分からないため `:latest` を補う
-- 全イメージのサイズ (skopeo)
 
 収集する情報 (未使用、`--all` で対象。ダウングレードへの備え):
 - ClusterVersion の `status.history` に残る過去のリリース
@@ -130,7 +131,7 @@ oc-mirctl exclude image "vllm/vllm-openai:v0.28.0" --reason "ラボ検証用"
 # CSV の relatedImages name で除外
 oc-mirctl exclude image --name "odh_workbench_jupyter_pytorch_rocm_py312_image" --reason "ROCm不要"
 
-# パターンマッチで一括除外
+# パターンマッチで一括除外 (relatedImages / Pod イメージ / 待機中・未使用のイメージが対象)
 oc-mirctl exclude image --match "*rocm*" --reason "ROCm不要"
 oc-mirctl exclude image --match "*gaudi*" --reason "Gaudi不要"
 
@@ -196,6 +197,7 @@ ImageSetConfiguration の特徴:
     それ以外のカタログで image が不明な場合はエラーにする
 - relatedImages + Pod イメージからサードパーティイメージを自動収集
   - タグも digest も無い Pod イメージは、collect 時に実行中の digest (status の imageID) で解決する
+- 待機中のワークロードのイメージを additionalImages に追加 (デフォルト。`--running-only` で除外)
 
 ### 5. mirror — oc-mirror を実行
 

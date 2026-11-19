@@ -72,7 +72,7 @@ mirror_data/ 下のクラスタディレクトリを自動検出`,
 
 func init() {
 	generateCmd.Flags().StringVar(&mirrorRegistry, "mirror-registry", "", "Mirror registry URL (host:port) — 省略時は imageset-config.yaml のみ生成")
-	generateCmd.Flags().BoolVar(&generateAll, "all", false, "collect 時点でクラスタに残っている未使用の情報 (過去のリリース / Operator の版 / キャッシュ済みイメージ) も対象にする")
+	generateCmd.Flags().BoolVar(&generateAll, "all", false, "collect 時点でクラスタに残っている未使用の情報 (過去のリリース / Operator の版 / キャッシュ済みイメージ) も対象にする (--running-only とは併用不可)")
 	generateCmd.Flags().BoolVar(&generateRunningOnly, "running-only", false, "待機中のワークロード (Pod が動いていない Deployment / CronJob / DaemonSet 等) のイメージを除き、動いている Pod のイメージだけを対象にする")
 	generateCmd.Flags().BoolVar(&pinOperators, "pin-operators", false, "Operator を現行 CSV のバージョンに固定する (minVersion = maxVersion)")
 	rootCmd.AddCommand(generateCmd)

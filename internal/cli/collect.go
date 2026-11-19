@@ -19,7 +19,11 @@ var collectCmd = &cobra.Command{
   - OCP リリースイメージ情報
   - インストール済み Operator (Subscription/CSV) と relatedImages
   - CatalogSource 情報
-  - 全 Pod で使用中のコンテナイメージ
+  - 動いている Pod のコンテナイメージ (完了済みの Pod は除く)
+
+待機中のワークロード (Pod が動いていない Deployment / StatefulSet / DaemonSet /
+Job / CronJob / DeploymentConfig) が参照するイメージも収集する
+(list / generate のデフォルトで対象。--running-only で除外)。
 
 さらに、現在は使われていないがクラスタに残っている情報も収集する
 (list / generate の --all で対象になる。ダウングレードへの備え):

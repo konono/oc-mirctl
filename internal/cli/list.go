@@ -686,7 +686,7 @@ func printHumanList(output *ListOutput) {
 func init() {
 	listCmd.Flags().BoolVar(&showExcluded, "show-excluded", false, "除外済みの項目も表示する")
 	listCmd.Flags().BoolVar(&listRunningOnly, "running-only", false, "待機中のワークロードのイメージを除き、動いている Pod のイメージだけを表示する")
-	listCmd.Flags().BoolVar(&listAll, "all", false, "collect 時点でクラスタに残っている未使用の情報 (過去のリリース / Operator の版 / キャッシュ済みイメージ) も表示する")
+	listCmd.Flags().BoolVar(&listAll, "all", false, "collect 時点でクラスタに残っている未使用の情報 (過去のリリース / Operator の版 / キャッシュ済みイメージ) も表示する (--running-only とは併用不可)")
 	listCmd.Flags().StringVarP(&outputFormat, "output", "o", "", "出力形式 (json, yaml)")
 	listCmd.Flags().StringVar(&authFile, "authfile", "", "レジストリ認証ファイル (default: 自動検出)")
 	listCmd.Flags().IntVar(&concurrency, "concurrency", 50, "サイズ取得の並列数")
