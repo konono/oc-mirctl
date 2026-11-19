@@ -332,7 +332,8 @@ func (c *Collector) Collect() (*Result, error) {
 		os.WriteFile(authFile, result.pullSecret, 0600)
 		defer os.Remove(authFile)
 	}
-	if size, err := GetReleaseImageSize(result.ReleaseImage, authFile); err == nil {
+	arch := c.clusterArchitecture(ctx)
+	if size, err := GetReleaseImageSize(result.ReleaseImage, authFile, arch); err == nil {
 		result.PlatformImageSize = size
 		fmt.Printf("    Platform: %s\n", FormatSize(size))
 	} else {
@@ -447,6 +448,35 @@ func detectUncoveredImages(result *Result, platformImages []string) []string {
 
 	sort.Strings(uncovered)
 	return uncovered
+}
+
+// clusterArchitecture はノードのアーキテクチャ (status.nodeInfo.architecture) のうち
+// 最も多いものを返す。multi-arch のリリースイメージのサイズを、実行環境 (例: macOS
+// arm64) ではなくクラスタのアーキテクチャで取得するために使う。取得できなければ "amd64"。
+func (c *Collector) clusterArchitecture(ctx context.Context) string {
+	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "nodes"}
+	nodeList, err := c.client.Resource(gvr).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return "amd64"
+	}
+	counts := map[string]int{}
+	for _, node := range nodeList.Items {
+		if a, _, _ := unstructured.NestedString(node.Object, "status", "nodeInfo", "architecture"); a != "" {
+			counts[a]++
+		}
+	}
+	return mostCommon(counts, "amd64")
+}
+
+// mostCommon は件数が最も多いキーを返す (同数なら名前順で先のもの、空なら def)
+func mostCommon(counts map[string]int, def string) string {
+	best, bestN := def, 0
+	for k, n := range counts {
+		if n > bestN || (n == bestN && k < best) {
+			best, bestN = k, n
+		}
+	}
+	return best
 }
 
 func (c *Collector) getPullSecret(ctx context.Context) ([]byte, error) {

@@ -280,6 +280,8 @@ func summarizeError(err error) string {
 	return msg
 }
 
+// FormatSize はバイト数を 1000 単位 (KB / MB / GB / TB) で表示する。
+// (oc adm release info や GitHub 等と同じ 10 進の単位。1024 単位の GiB ではない)
 func FormatSize(bytes int64) string {
 	if bytes < 0 {
 		return "  unknown"
@@ -289,12 +291,15 @@ func FormatSize(bytes int64) string {
 	}
 
 	const (
-		KB = 1024
-		MB = KB * 1024
-		GB = MB * 1024
+		KB = 1000
+		MB = KB * 1000
+		GB = MB * 1000
+		TB = GB * 1000
 	)
 
 	switch {
+	case bytes >= TB:
+		return fmt.Sprintf("%5.1f TB", float64(bytes)/float64(TB))
 	case bytes >= GB:
 		return fmt.Sprintf("%5.1f GB", float64(bytes)/float64(GB))
 	case bytes >= MB:
