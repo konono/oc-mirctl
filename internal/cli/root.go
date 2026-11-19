@@ -3,7 +3,9 @@ package cli
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"runtime/debug"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -67,8 +69,24 @@ func resolveVersion(v, c, d string, info *debug.BuildInfo) (string, string, stri
 	if modified && c != "unknown" {
 		c += "-dirty"
 	}
+	// go install (モジュールプロキシ経由) では vcs.* が入らないので、
+	// 疑似バージョン (v0.0.0-YYYYMMDDhhmmss-<12桁のコミット>) から補う
+	if m := pseudoVersionRe.FindStringSubmatch(v); m != nil {
+		if c == "unknown" {
+			c = m[2]
+		}
+		if d == "unknown" {
+			if t, err := time.Parse("20060102150405", m[1]); err == nil {
+				d = t.UTC().Format(time.RFC3339)
+			}
+		}
+	}
 	return v, c, d
 }
+
+// pseudoVersionRe は Go の疑似バージョンの時刻とコミット部分にマッチする
+// (例: v0.0.0-20261119073140-dcae204670a9、v1.2.4-0.20261119073140-dcae204670a9)
+var pseudoVersionRe = regexp.MustCompile(`[.-](\d{14})-([0-9a-f]{12})(\+.*)?$`)
 
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {

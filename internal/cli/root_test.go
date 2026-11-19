@@ -23,7 +23,7 @@ func TestResolveVersion(t *testing.T) {
 			name: "go install @main (疑似バージョン)",
 			v:    "dev", c: "unknown", d: "unknown",
 			info:  &debug.BuildInfo{Main: debug.Module{Version: "v0.0.0-20261119072208-6a469f569639"}},
-			wantV: "v0.0.0-20261119072208-6a469f569639", wantC: "unknown", wantD: "unknown",
+			wantV: "v0.0.0-20261119072208-6a469f569639", wantC: "6a469f569639", wantD: "2026-11-19T07:22:08Z",
 		},
 		{
 			name: "リポジトリ内の go build (vcs 情報あり、変更あり)",
@@ -34,6 +34,18 @@ func TestResolveVersion(t *testing.T) {
 				{Key: "vcs.modified", Value: "true"},
 			}},
 			wantV: "dev", wantC: "6a469f569639-dirty", wantD: "2026-11-19T07:22:09Z",
+		},
+		{
+			name: "go install @vX.Y.Z (タグ) は疑似バージョンではないので commit は補わない",
+			v:    "dev", c: "unknown", d: "unknown",
+			info:  &debug.BuildInfo{Main: debug.Module{Version: "v0.1.0"}},
+			wantV: "v0.1.0", wantC: "unknown", wantD: "unknown",
+		},
+		{
+			name: "タグ以降のコミットの疑似バージョン",
+			v:    "dev", c: "unknown", d: "unknown",
+			info:  &debug.BuildInfo{Main: debug.Module{Version: "v0.1.1-0.20261119073140-dcae204670a9"}},
+			wantV: "v0.1.1-0.20261119073140-dcae204670a9", wantC: "dcae204670a9", wantD: "2026-11-19T07:31:40Z",
 		},
 		{
 			name: "ビルド情報なし",
