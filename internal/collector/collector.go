@@ -372,7 +372,7 @@ func (c *Collector) Collect() (*Result, error) {
 	}
 
 	fmt.Println("==> ノードにキャッシュされた未使用イメージを検出...")
-	nodeImages, truncated, err := c.getNodeImages(ctx)
+	nodeImages, err := c.getNodeImages(ctx)
 	if err != nil {
 		fmt.Printf("    WARN: %v\n", err)
 	} else {
@@ -388,11 +388,6 @@ func (c *Collector) Collect() (*Result, error) {
 		}
 		result.UnusedImages = detectUnusedImages(nodeImages, result, coverage)
 		fmt.Printf("    %d 個の未使用イメージ (list / generate の --all で対象になります)\n", len(result.UnusedImages))
-		if truncated > 0 {
-			fmt.Printf("    WARN: %d ノードが status.images の上限 (%d 件) に達しています。"+
-				"kubelet はサイズの大きい順にしか報告しないため、小さい未使用イメージは検出できない場合があります\n",
-				truncated, nodeStatusMaxImages)
-		}
 	}
 
 	return result, nil

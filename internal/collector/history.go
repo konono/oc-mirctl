@@ -273,21 +273,18 @@ func (n nodeImage) ref() string {
 }
 
 // getNodeImages は全ノードの status.images を返す。kubelet はノードごとにサイズの
-// 大きい順で最大 50 件 (nodeStatusMaxImages) しか報告しないため、上限に達したノード
-// の数も返す (取りこぼしの可能性を警告するため)。
-func (c *Collector) getNodeImages(ctx context.Context) ([]nodeImage, int, error) {
+// 大きい順で最大 50 件 (kubelet の nodeStatusMaxImages の既定値) しか報告しないため、小さい
+// イメージは含まれないことがある。この一覧を使うのは --all の未使用イメージだけで、
+// 使用中・待機中のイメージは Pod やワークロードの定義から取るので影響しない。
+func (c *Collector) getNodeImages(ctx context.Context) ([]nodeImage, error) {
 	gvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "nodes"}
 	nodeList, err := c.client.Resource(gvr).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, 0, fmt.Errorf("Node の取得に失敗: %w", err)
+		return nil, fmt.Errorf("Node の取得に失敗: %w", err)
 	}
 	var images []nodeImage
-	truncated := 0
 	for _, node := range nodeList.Items {
 		list, _, _ := unstructured.NestedSlice(node.Object, "status", "images")
-		if len(list) >= nodeStatusMaxImages {
-			truncated++
-		}
 		for _, img := range list {
 			iMap, ok := img.(map[string]interface{})
 			if !ok {
@@ -306,11 +303,8 @@ func (c *Collector) getNodeImages(ctx context.Context) ([]nodeImage, int, error)
 			}
 		}
 	}
-	return images, truncated, nil
+	return images, nil
 }
-
-// nodeStatusMaxImages は kubelet が node status に載せるイメージ数の既定上限
-const nodeStatusMaxImages = 50
 
 // detectUnusedImages はノードにキャッシュされたイメージのうち、使用中のもの
 // (Pod / relatedImages / CatalogSource / 待機中のワークロード) とリリース (現在・過去) に含まれるものを
