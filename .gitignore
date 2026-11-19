@@ -6,3 +6,4 @@ mirror_data/
 mise.toml
 .envrc
 .kube/
+dist/

@@ -4,6 +4,57 @@
 
 ## Install
 
+### ビルド済みバイナリ (GitHub Releases)
+
+[Releases](https://github.com/konono/oc-mirctl/releases) から OS / アーキテクチャに合ったアーカイブをダウンロードする
+(linux / darwin × amd64 / arm64)。`checksums.txt` で検証できる。
+
+```bash
+VERSION=v0.1.0   # Releases の最新タグに置き換える
+OS=linux         # linux または darwin
+ARCH=amd64       # amd64 または arm64
+curl -LO "https://github.com/konono/oc-mirctl/releases/download/${VERSION}/oc-mirctl_${OS}_${ARCH}.tar.gz"
+curl -LO "https://github.com/konono/oc-mirctl/releases/download/${VERSION}/checksums.txt"
+grep "oc-mirctl_${OS}_${ARCH}.tar.gz" checksums.txt | sha256sum -c -   # macOS は shasum -a 256 -c -
+tar xzf "oc-mirctl_${OS}_${ARCH}.tar.gz" oc-mirctl
+sudo install -m 755 oc-mirctl /usr/local/bin/
+```
+
+### 更新 (update)
+
+ビルド済みバイナリでインストールした場合は、`update` で最新の Release に更新できる。
+
+```bash
+# 更新の有無を確認するだけ
+oc-mirctl update --check
+
+# 最新の Release に更新 (インストール先に書き込む権限が必要。/usr/local/bin なら sudo)
+sudo oc-mirctl update
+```
+
+- 実行環境の OS / アーキテクチャ向けのアーカイブをダウンロードし、`checksums.txt` の SHA256 で検証してから実行中のバイナリを置き換える
+- `make build` などの開発ビルドは、バージョンをリリースと比較できないため自動では更新しない。最新の Release で置き換える場合は `--force` を付ける
+- `go install` でインストールした場合も更新できる (疑似バージョンはリリースより古いと判定される)。`go install ...@latest` で更新してもよい
+
+### go install
+
+```bash
+go install github.com/konono/oc-mirctl/cmd/oc-mirctl@latest
+# → $(go env GOPATH)/bin/oc-mirctl (GOBIN を設定している場合はそこ)
+```
+
+`oc-mirctl --version` には、モジュールのバージョン (タグが無い場合は `v0.0.0-<時刻>-<コミット>` 形式) が表示される。
+
+### リリース手順 (メンテナ向け)
+
+[release-please](https://github.com/googleapis/release-please) と [GoReleaser](https://goreleaser.com/) で自動化している。
+
+1. main に [Conventional Commits](https://www.conventionalcommits.org/) 形式のコミット (`feat:` / `fix:` 等) が入ると、
+   release-please がバージョンと CHANGELOG を更新するリリース PR を作成・更新する (Conventional Commits 形式でないコミットはリリース対象として数えられない)
+2. リリース PR をマージすると、タグと GitHub Release が作られ、GoReleaser がビルド済みバイナリと `checksums.txt` を添付する
+
+### ソースからビルド
+
 ```bash
 make build
 # → bin/oc-mirctl

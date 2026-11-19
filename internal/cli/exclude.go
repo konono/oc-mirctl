@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/nict-ocpai/oc-mirctl/internal/collector"
+	"github.com/konono/oc-mirctl/internal/collector"
 	"github.com/spf13/cobra"
 )
 

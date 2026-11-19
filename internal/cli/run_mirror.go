@@ -1,7 +1,7 @@
 package cli
 
 import (
-	"github.com/nict-ocpai/oc-mirctl/internal/mirror"
+	"github.com/konono/oc-mirctl/internal/mirror"
 	"github.com/spf13/cobra"
 )
 

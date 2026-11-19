@@ -13,7 +13,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"sigs.k8s.io/yaml"
 
-	"github.com/nict-ocpai/oc-mirctl/internal/generator"
+	"github.com/konono/oc-mirctl/internal/generator"
 )
 
 // fakeDynamic は List だけを実装した dynamic.Interface (テスト用)。
