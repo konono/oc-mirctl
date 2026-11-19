@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.1](https://github.com/konono/oc-mirctl/compare/v1.0.0...v1.0.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* drop the node status image limit warning from collect ([a00dc08](https://github.com/konono/oc-mirctl/commit/a00dc0874d4250aa1c97f8f6cd2840c9573fd27a))
+* drop the node status image limit warning from collect ([412f35c](https://github.com/konono/oc-mirctl/commit/412f35c13493bc8b147cfbab1ebe8729e237dda6))
+
 ## 1.0.0 (2026-11-19)
 
 
