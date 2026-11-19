@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.3](https://github.com/konono/oc-mirctl/compare/v1.0.2...v1.0.3) (2026-11-19)
+
+
+### Bug Fixes
+
+* drop the size note line from list output ([1b19c06](https://github.com/konono/oc-mirctl/commit/1b19c06c9445055a8b25cbdebddd85f4afb841c0))
+* drop the size note line from list output ([6cba479](https://github.com/konono/oc-mirctl/commit/6cba47930359f6d36cf29e1ce581b910f2eccec7))
+
 ## [1.0.2](https://github.com/konono/oc-mirctl/compare/v1.0.1...v1.0.2) (2026-11-19)
 
 
