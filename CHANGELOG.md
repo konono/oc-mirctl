@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.2](https://github.com/konono/oc-mirctl/compare/v1.0.1...v1.0.2) (2026-11-19)
+
+
+### Bug Fixes
+
+* count each image once in size totals and show sizes in decimal GB ([2b8b684](https://github.com/konono/oc-mirctl/commit/2b8b684ba2ae2e68950f42319c40f80cdfd4b3fc))
+* count each image once in size totals and show sizes in decimal GB ([1947d09](https://github.com/konono/oc-mirctl/commit/1947d097007a3b3243669897176eae51265d4d17))
+
 ## [1.0.1](https://github.com/konono/oc-mirctl/compare/v1.0.0...v1.0.1) (2026-11-19)
 
 
