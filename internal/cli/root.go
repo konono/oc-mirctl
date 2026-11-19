@@ -37,6 +37,13 @@ func versionString() string {
 	return fmt.Sprintf("%s (commit=%s, built=%s)", v, c, d)
 }
 
+// currentVersion は実行中のバイナリのバージョン (ldflags またはビルド情報) を返す
+func currentVersion() string {
+	info, _ := debug.ReadBuildInfo()
+	v, _, _ := resolveVersion(version, commit, buildDate, info)
+	return v
+}
+
 // resolveVersion は ldflags で埋め込まれていない値 (既定値のまま) をビルド情報から補う。
 //   - go install <module>@<version>: Main.Version にモジュールのバージョン
 //     (タグ、または v0.0.0-<時刻>-<コミット> 形式の疑似バージョン) が入る
