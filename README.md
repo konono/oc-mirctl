@@ -60,7 +60,13 @@ oc-mirctl collect --kubeconfig ~/.kube/config
 出力: `mirror_data/<cluster-name>/collected-data.json`
 
 collect はオプションなしで、その時点でクラスタに登録されている情報を **使用中のものも未使用のものも** すべて収集する。
-何を対象にするかの絞り込みは `list` / `generate` 側で行う (デフォルト = 使用中のみ、`--all` = 未使用も含む)。
+何を対象にするかの絞り込みは `list` / `generate` 側で行う。
+
+| 指定 | 対象 |
+|---|---|
+| デフォルト | 使用中 + 待機中のワークロードのイメージ |
+| `--running-only` | 使用中 (動いている Pod のイメージ) のみ |
+| `--all` | 使用中 + 待機中 + 未使用 (`--running-only` とは併用不可) |
 
 収集する情報 (使用中):
 - OCP バージョン・チャネル・リリースイメージ
@@ -69,6 +75,14 @@ collect はオプションなしで、その時点でクラスタに登録され
 - CSV の `spec.relatedImages` (NVIDIA 等のサードパーティイメージ)
 - 全 CatalogSource とそのインデックスイメージ
 - 全 Pod で使用中のコンテナイメージ
+
+収集する情報 (待機中のワークロード、デフォルトで対象・`--running-only` で除外):
+- Deployment / StatefulSet / DaemonSet / Job / CronJob / DeploymentConfig の Pod テンプレートが参照するが、
+  動いている Pod では使われていないイメージ (例: replicas=0 の Deployment、次回実行を待つ CronJob、
+  対象ノードの無い DaemonSet)。disconnected 環境では、ミラーしていないとスケールアップやノード追加の時点で
+  `ImagePullBackOff` になるため、デフォルトで含める
+- platform / Operator の relatedImages でカバーされるもの、内部レジストリのイメージは除く
+- タグも digest も無い参照は、実行中の digest が分からないため `:latest` を補う
 - 全イメージのサイズ (skopeo)
 
 収集する情報 (未使用、`--all` で対象。ダウングレードへの備え):
@@ -79,14 +93,18 @@ collect はオプションなしで、その時点でクラスタに登録され
 未使用の情報の制約:
 - kubelet はノードの `status.images` にサイズの大きい順で最大 50 件しか載せないため、小さいイメージは検出できない場合がある
   (上限に達したノードがあると collect が警告する)。ディスク逼迫時の GC で消えたイメージも検出できない
+- ノードが削除・入れ替えされると (オートスケール等)、そのノードのキャッシュも失われる
 - InstallPlan は OLM により古いものから削除されるため、古い版は残っていない場合がある
 - OCP 本体のダウングレードは基本的にサポートされない (z-stream 内のロールバックのみ)。ミラーを用意しても戻せるとは限らない
 
 ### 2. list — 収集済みデータを一覧表示
 
 ```bash
-# 全 Operator と relatedImages をサイズ付きで表示 (使用中のもののみ)
+# 全 Operator と relatedImages をサイズ付きで表示 (使用中 + 待機中のワークロード)
 oc-mirctl list
+
+# 動いている Pod のイメージだけを表示
+oc-mirctl list --running-only
 
 # 未使用の過去のリリース / Operator の版 / キャッシュ済みイメージも表示
 oc-mirctl list --all
@@ -131,8 +149,11 @@ oc-mirctl include image --match "*rocm*"
 `collected-data.json` を元に oc-mirror 用の設定を生成する。
 
 ```bash
-# ImageSetConfiguration のみ生成 (最新状態のみ、Operator は現行〜チャネル最新)
+# ImageSetConfiguration のみ生成 (使用中 + 待機中のワークロード、Operator は現行〜チャネル最新)
 oc-mirctl generate
+
+# 動いている Pod のイメージだけを対象にする (待機中のワークロードのイメージを除く)
+oc-mirctl generate --running-only
 
 # Operator を現行バージョンに固定 (次のアップグレード先は含めない)
 oc-mirctl generate --pin-operators

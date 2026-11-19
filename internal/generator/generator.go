@@ -35,6 +35,10 @@ type Options struct {
 	// (過去のリリース、過去にインストールした Operator の版、ノードにキャッシュされた
 	// 未使用イメージ) も対象に含める。false の場合は使用中のものだけを対象にする。
 	All bool
+	// RunningOnly が true の場合、待機中のワークロード (Pod が動いていない Deployment /
+	// CronJob / DaemonSet 等) が参照するイメージを対象から外し、動いている Pod の
+	// イメージだけにする。false (デフォルト) では含める。All と同時には指定できない。
+	RunningOnly bool
 	// PinOperators が true の場合、Operator を現行 CSV のバージョンに固定する
 	// (maxVersion = minVersion)。false の場合は現行〜チャネル最新をミラーする。
 	//
@@ -52,9 +56,16 @@ type CollectedData struct {
 	Operators      []OperatorInfo  `json:"operators"`
 	CustomImages    []string        `json:"customImages"`
 	UncoveredImages []string        `json:"uncoveredImages"`
+	IdleImages      []IdleImage     `json:"idleImages"`
 	PastReleases    []ReleaseEntry  `json:"pastReleases"`
 	UnusedImages    []string        `json:"unusedImages"`
 	CatalogSources  []CatalogSource `json:"catalogSources"`
+}
+
+// IdleImage は待機中のワークロード (replicas=0 の Deployment 等) が参照するイメージ
+type IdleImage struct {
+	Image     string   `json:"image"`
+	Workloads []string `json:"workloads"`
 }
 
 // ReleaseEntry は ClusterVersion の履歴に残る過去のリリース
@@ -157,6 +168,9 @@ type ImageDigestSource struct {
 }
 
 func New(outputDir, mirrorRegistry string, opts Options) (*Generator, error) {
+	if opts.All && opts.RunningOnly {
+		return nil, fmt.Errorf("--all と --running-only は同時に指定できません (--all は待機中のワークロードのイメージも含む全体です)")
+	}
 	dataFile := filepath.Join(outputDir, "collected-data.json")
 	raw, err := os.ReadFile(dataFile)
 	if err != nil {
@@ -293,6 +307,11 @@ func (g *Generator) GenerateImageSetConfig() error {
 	}
 	for _, img := range g.data.UncoveredImages {
 		additionalSet[img] = true
+	}
+	if !g.opts.RunningOnly {
+		for _, ii := range g.data.IdleImages {
+			additionalSet[ii.Image] = true
+		}
 	}
 	if g.opts.All {
 		for _, img := range g.data.UnusedImages {

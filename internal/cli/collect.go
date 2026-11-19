@@ -104,6 +104,7 @@ var collectCmd = &cobra.Command{
 		for _, op := range finalResult.Operators {
 			pastOps += len(op.PastVersions)
 		}
+		fmt.Printf("  Idle Images:      %d (待機中のワークロード。--running-only で除外)\n", len(finalResult.IdleImages))
 		fmt.Printf("  未使用 (--all で対象): 過去のリリース %d / 過去の Operator の版 %d / 未使用イメージ %d\n",
 			len(finalResult.PastReleases), pastOps, len(finalResult.UnusedImages))
 		if len(finalResult.UncoveredImages) > 0 {
@@ -187,6 +188,10 @@ func normalizedJSON(r *collector.Result) (string, error) {
 	// 並び順の違いは差分にしない
 	sort.Slice(c.Operators, func(x, y int) bool { return c.Operators[x].Key() < c.Operators[y].Key() })
 	sort.Slice(c.CatalogSources, func(x, y int) bool { return c.CatalogSources[x].Key() < c.CatalogSources[y].Key() })
+	sort.Slice(c.IdleImages, func(x, y int) bool { return c.IdleImages[x].Image < c.IdleImages[y].Image })
+	for i := range c.IdleImages {
+		sort.Strings(c.IdleImages[i].Workloads)
+	}
 	for _, list := range [][]string{c.PodImages, c.CustomImages, c.UncoveredImages, c.UnusedImages, c.PrivateRegistries, c.PrivateImages} {
 		sort.Strings(list)
 	}

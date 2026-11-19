@@ -165,10 +165,14 @@ func excludeByMatch(data *collector.Result, excl *collector.Exclusions, pattern 
 		}
 	}
 
-	// customImages / uncoveredImages / unusedImages (generate --all で対象) でもマッチ
+	// customImages / uncoveredImages / idleImages / unusedImages (generate --all で対象) でもマッチ
 	seen := map[string]bool{}
 	var images []string
-	for _, list := range [][]string{data.CustomImages, data.UncoveredImages, data.UnusedImages} {
+	idle := make([]string, 0, len(data.IdleImages))
+	for _, ii := range data.IdleImages {
+		idle = append(idle, ii.Image)
+	}
+	for _, list := range [][]string{data.CustomImages, data.UncoveredImages, idle, data.UnusedImages} {
 		for _, img := range list {
 			if !seen[img] {
 				seen[img] = true

@@ -20,6 +20,9 @@ import (
 
 type Collector struct {
 	client dynamic.Interface
+	// podSpecImages は動いている Pod の spec に書かれたイメージ参照 (解決前の文字列)。
+	// ワークロード定義の参照と照合し、タグなし参照の Pod を待機中と誤判定しないために使う。
+	podSpecImages map[string]bool
 }
 
 type RelatedImage struct {
@@ -71,6 +74,9 @@ type Result struct {
 	PodImages        []string       `json:"podImages"`
 	CustomImages     []string       `json:"customImages"`
 	UncoveredImages  []string       `json:"uncoveredImages,omitempty"`
+	// IdleImages は待機中のワークロード (replicas=0 の Deployment、CronJob、対象ノードの
+	// 無い DaemonSet 等) が参照するが、動いている Pod では使われていないイメージ
+	IdleImages       []IdleImage    `json:"idleImages,omitempty"`
 	// PastReleases は ClusterVersion の history に残る過去のリリース (古い順)
 	PastReleases     []ReleaseEntry `json:"pastReleases,omitempty"`
 	// UnusedImages はノードにキャッシュされているが、使用中のもの・リリースに
@@ -116,6 +122,12 @@ func (r *Result) AllImages() []string {
 		if !seen[img] {
 			seen[img] = true
 			images = append(images, img)
+		}
+	}
+	for _, ii := range r.IdleImages {
+		if !seen[ii.Image] {
+			seen[ii.Image] = true
+			images = append(images, ii.Image)
 		}
 	}
 	for _, img := range r.UnusedImages {
@@ -342,6 +354,21 @@ func (c *Collector) Collect() (*Result, error) {
 		}
 	} else {
 		fmt.Println("    全 Pod イメージがカバーされています")
+	}
+
+	fmt.Println("==> ワークロード定義から待機中のワークロードのイメージを検出...")
+	if workloadImages, err := c.getWorkloadImages(ctx); err != nil {
+		fmt.Printf("    WARN: %v\n", err)
+	} else {
+		result.IdleImages = detectIdleImages(workloadImages, c.podSpecImages, result, platformImages)
+		if len(result.IdleImages) > 0 {
+			fmt.Printf("    %d 個 (Pod は動いていないが定義が参照。list / generate のデフォルトで対象、--running-only で除外):\n", len(result.IdleImages))
+			for _, ii := range result.IdleImages {
+				fmt.Printf("      - %s (%s)\n", ii.Image, strings.Join(ii.Workloads, ", "))
+			}
+		} else {
+			fmt.Println("    なし")
+		}
 	}
 
 	fmt.Println("==> ノードにキャッシュされた未使用イメージを検出...")
@@ -594,9 +621,20 @@ func (c *Collector) getPodImages(ctx context.Context) ([]string, error) {
 	}
 
 	imageSet := map[string]bool{}
+	c.podSpecImages = map[string]bool{}
 	for _, pod := range podList.Items {
+		// 完了済み (Succeeded / Failed) の Pod は使用中に数えない。CronJob / Job が残した
+		// 完了済み Pod のイメージは、ワークロード定義側から待機中として扱う
+		// (使用中に数えると --running-only に入り、待機中の判定からも漏れる)。
+		// Pending 等の進行中の Pod は使用中とする。
+		if phase, _, _ := unstructured.NestedString(pod.Object, "status", "phase"); phase == "Succeeded" || phase == "Failed" {
+			continue
+		}
 		for _, img := range podContainerImages(pod.Object) {
 			imageSet[img] = true
+		}
+		for _, img := range rawPodImages(pod.Object) {
+			c.podSpecImages[img] = true
 		}
 	}
 

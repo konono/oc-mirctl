@@ -313,7 +313,7 @@ func (c *Collector) getNodeImages(ctx context.Context) ([]nodeImage, int, error)
 const nodeStatusMaxImages = 50
 
 // detectUnusedImages はノードにキャッシュされたイメージのうち、使用中のもの
-// (Pod / relatedImages / CatalogSource) とリリース (現在・過去) に含まれるものを
+// (Pod / relatedImages / CatalogSource / 待機中のワークロード) とリリース (現在・過去) に含まれるものを
 // 除いた参照を返す。過去のリリースのイメージは --all で platform としてミラーされるため除く。
 func detectUnusedImages(nodeImages []nodeImage, result *Result, platformImages []string) []string {
 	used := map[string]bool{}
@@ -335,6 +335,10 @@ func detectUnusedImages(nodeImages []nodeImage, result *Result, platformImages [
 	}
 	for _, cs := range result.CatalogSources {
 		add(cs.Image)
+	}
+	// 待機中のワークロードのイメージは「今の定義」が参照しているので未使用ではない
+	for _, ii := range result.IdleImages {
+		add(ii.Image)
 	}
 	add(result.ReleaseImage)
 	for _, r := range result.PastReleases {

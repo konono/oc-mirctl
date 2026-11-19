@@ -366,3 +366,40 @@ func TestCompareVersions(t *testing.T) {
 		}
 	}
 }
+
+func TestIdleImages(t *testing.T) {
+	dir := t.TempDir()
+	writeData(t, dir, "collected-data.json", CollectedData{
+		OCPVersion:   "4.22.21",
+		CustomImages: []string{"example.com/running@sha256:aaa"},
+		IdleImages:   []IdleImage{{Image: "example.com/idle:1.0", Workloads: []string{"Deployment ns/app"}}},
+		UnusedImages: []string{"example.com/old@sha256:bbb"},
+	})
+	names := func(cfg ImageSetConfig) map[string]bool {
+		m := map[string]bool{}
+		for _, img := range cfg.Mirror.AdditionalImages {
+			m[img.Name] = true
+		}
+		return m
+	}
+
+	// デフォルト: 動いている Pod + 待機中のワークロード
+	got := names(generate(t, dir, Options{}))
+	if !got["example.com/running@sha256:aaa"] || !got["example.com/idle:1.0"] || got["example.com/old@sha256:bbb"] || len(got) != 2 {
+		t.Errorf("default: got %v", got)
+	}
+	// --running-only: 動いている Pod のみ
+	got = names(generate(t, dir, Options{RunningOnly: true}))
+	if !got["example.com/running@sha256:aaa"] || len(got) != 1 {
+		t.Errorf("running-only: got %v", got)
+	}
+	// --all: 全部
+	got = names(generate(t, dir, Options{All: true}))
+	if len(got) != 3 {
+		t.Errorf("all: got %v", got)
+	}
+	// --all と --running-only は併用不可
+	if _, err := New(dir, "", Options{All: true, RunningOnly: true}); err == nil {
+		t.Error("expected error for --all with --running-only")
+	}
+}
