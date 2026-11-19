@@ -15,7 +15,9 @@ import (
 )
 
 var (
-	showExcluded bool
+	showExcluded    bool
+	listAll         bool
+	listRunningOnly bool
 	outputFormat string
 	authFile     string
 	concurrency  int
@@ -27,7 +29,17 @@ type ListOutput struct {
 	Operators        []ListOperatorInfo `json:"operators" yaml:"operators"`
 	Images           []ListImageInfo    `json:"images" yaml:"images"`
 	UncoveredImages  []ListImageInfo    `json:"uncoveredImages,omitempty" yaml:"uncoveredImages,omitempty"`
+	// IdleImages は待機中のワークロードが参照するイメージ (--running-only のときは出力しない)
+	IdleImages       []ListIdleImage    `json:"idleImages,omitempty" yaml:"idleImages,omitempty"`
+	// 以下は --all のときだけ出力する (collect 時点でクラスタに残っている未使用の情報)
+	PastReleases     []string           `json:"pastReleases,omitempty" yaml:"pastReleases,omitempty"`
+	UnusedImages     []ListImageInfo    `json:"unusedImages,omitempty" yaml:"unusedImages,omitempty"`
 	Summary          SummaryInfo        `json:"summary" yaml:"summary"`
+}
+
+type ListIdleImage struct {
+	ListImageInfo `json:",inline" yaml:",inline"`
+	Workloads     []string `json:"workloads" yaml:"workloads"`
 }
 
 type ClusterInfo struct {
@@ -53,6 +65,7 @@ type ListOperatorInfo struct {
 	ExcludeReason string          `json:"excludeReason,omitempty" yaml:"excludeReason,omitempty"`
 	LastSeen      string          `json:"lastSeen" yaml:"lastSeen"`
 	RelatedImages []ListImageInfo `json:"relatedImages,omitempty" yaml:"relatedImages,omitempty"`
+	PastVersions  []string        `json:"pastVersions,omitempty" yaml:"pastVersions,omitempty"`
 }
 
 type ListImageInfo struct {
@@ -113,12 +126,21 @@ var listCmd = &cobra.Command{
 	Long: `収集済みのデータを一覧表示する。
 各 Operator の relatedImages とサイズを表示する。
 
+デフォルトでは collect 時点で使用中のものと、待機中のワークロード (Pod が動いていない
+Deployment / CronJob / DaemonSet 等) が参照するイメージを表示する。
+
+  --running-only  待機中のワークロードのイメージを除き、動いている Pod のイメージだけを表示
+  --all           未使用の過去のリリース / Operator の版 / キャッシュ済みイメージも表示
   -o json   JSON 形式で出力
   -o yaml   YAML 形式で出力`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dir, err := resolveOutputDir()
 		if err != nil {
 			return err
+		}
+
+		if listAll && listRunningOnly {
+			return fmt.Errorf("--all と --running-only は同時に指定できません (--all は待機中のワークロードのイメージも含む全体です)")
 		}
 
 		data, err := collector.LoadPrevious(dir)
@@ -155,7 +177,7 @@ var listCmd = &cobra.Command{
 			imageSizes = collector.FetchSizes(allImages, concurrency, af)
 		}
 
-		output := buildListOutput(data, excl, imageSizes)
+		output := buildListOutput(data, excl, imageSizes, listAll, listRunningOnly)
 
 		switch outputFormat {
 		case "json":
@@ -176,7 +198,7 @@ var listCmd = &cobra.Command{
 	},
 }
 
-func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes map[string]int64) *ListOutput {
+func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes map[string]int64, all, runningOnly bool) *ListOutput {
 	channel := data.OCPChannel
 	if channel == "" {
 		parts := strings.SplitN(data.OCPVersion, ".", 3)
@@ -204,6 +226,15 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 			Channel:       op.Channel,
 			CatalogSource: op.CatalogSource,
 			LastSeen:      op.LastSeen,
+		}
+		if all {
+			for _, pv := range op.PastVersions {
+				ch := pv.Channel
+				if ch == "" {
+					ch = "not in catalog"
+				}
+				info.PastVersions = append(info.PastVersions, pv.Version+" ("+ch+")")
+			}
 		}
 
 		excluded, reason := excl.IsOperatorExcluded(op.PackageName)
@@ -313,6 +344,38 @@ func buildListOutput(data *collector.Result, excl *collector.Exclusions, sizes m
 		output.Summary.UncoveredImages++
 	}
 
+	if !runningOnly {
+		for _, ii := range data.IdleImages {
+			info := ListIdleImage{
+				ListImageInfo: ListImageInfo{Name: ii.Image, ShortName: shortenImage(ii.Image)},
+				Workloads:     ii.Workloads,
+			}
+			if excluded, reason := excl.IsImageExcluded(ii.Image); excluded {
+				info.Excluded = true
+				info.ExcludeReason = reason
+			}
+			if s, ok := sizes[ii.Image]; ok {
+				info.SizeBytes = s
+				info.Size = collector.FormatSize(s)
+			}
+			output.IdleImages = append(output.IdleImages, info)
+		}
+	}
+
+	if all {
+		for _, r := range data.PastReleases {
+			output.PastReleases = append(output.PastReleases, r.Version)
+		}
+		for _, img := range data.UnusedImages {
+			info := ListImageInfo{Name: img, ShortName: shortenImage(img)}
+			if s, ok := sizes[img]; ok {
+				info.SizeBytes = s
+				info.Size = collector.FormatSize(s)
+			}
+			output.UnusedImages = append(output.UnusedImages, info)
+		}
+	}
+
 	output.Summary.PlatformSizeBytes = data.PlatformImageSize
 	output.Summary.TotalSizeBytes = output.Summary.PlatformSizeBytes + output.Summary.OperatorSizeBytes + output.Summary.CustomImageSizeBytes + output.Summary.UncoveredSizeBytes
 
@@ -368,6 +431,9 @@ func printHumanList(output *ListOutput) {
 	}
 	tw.Append([]string{"OCP " + output.Platform.Version, output.Platform.Channel, repo + " " + releaseRef, platformSize})
 	tw.Render()
+	if len(output.PastReleases) > 0 {
+		fmt.Printf("  過去のリリース (--all): %s\n", strings.Join(output.PastReleases, ", "))
+	}
 	fmt.Println()
 
 	// Operators — カタログ別にテーブルを分ける
@@ -420,6 +486,12 @@ func printHumanList(output *ListOutput) {
 		}
 
 		tw.Render()
+
+		for _, op := range ops {
+			if len(op.PastVersions) > 0 && !(op.Excluded && !showExcluded) {
+				fmt.Printf("  %s の過去の版 (--all): %s\n", op.PackageName, strings.Join(op.PastVersions, ", "))
+			}
+		}
 
 		for _, op := range ops {
 			if op.Excluded && !showExcluded {
@@ -557,6 +629,41 @@ func printHumanList(output *ListOutput) {
 		fmt.Println("  → generate で additionalImages に自動追加されます")
 	}
 
+	if len(output.IdleImages) > 0 {
+		fmt.Printf("\nIdle Workload Images (%d) — Pod は動いていないがワークロード定義が参照するイメージ:\n", len(output.IdleImages))
+		tw = tablewriter.NewWriter(os.Stdout)
+		tw.SetHeader([]string{"", "Repository", "Tag", "Digest", "Size", "Workloads"})
+		tw.SetBorders(tablewriter.Border{Left: true, Top: true, Right: true, Bottom: true})
+		tw.SetAutoWrapText(false)
+		for _, img := range output.IdleImages {
+			if img.Excluded && !showExcluded {
+				continue
+			}
+			st := ""
+			if img.Excluded {
+				st = "✗"
+			}
+			imgRepo, imgTag, imgDigest := splitImageRef(img.Name)
+			tw.Append([]string{st, imgRepo, imgTag, imgDigest, strings.TrimSpace(img.Size), strings.Join(img.Workloads, ", ")})
+		}
+		tw.Render()
+		fmt.Println("  → generate で additionalImages に追加されます (--running-only で除外)")
+	}
+
+	if len(output.UnusedImages) > 0 {
+		fmt.Printf("\nUnused Images (%d) — ノードにキャッシュされた未使用イメージ (--all):\n", len(output.UnusedImages))
+		tw = tablewriter.NewWriter(os.Stdout)
+		tw.SetHeader([]string{"Repository", "Tag", "Digest", "Size"})
+		tw.SetBorders(tablewriter.Border{Left: true, Top: true, Right: true, Bottom: true})
+		tw.SetAutoWrapText(false)
+		for _, img := range output.UnusedImages {
+			imgRepo, imgTag, imgDigest := splitImageRef(img.Name)
+			tw.Append([]string{imgRepo, imgTag, imgDigest, strings.TrimSpace(img.Size)})
+		}
+		tw.Render()
+		fmt.Println("  → generate --all で additionalImages に追加されます")
+	}
+
 	if output.Summary.ExcludedSizeBytes > 0 {
 		fmt.Printf("\nExcluded: %s (%d images) — oc-mirctl exclude-list で確認\n",
 			collector.FormatSize(output.Summary.ExcludedSizeBytes), output.Summary.ExcludedRelatedImages)
@@ -578,6 +685,8 @@ func printHumanList(output *ListOutput) {
 
 func init() {
 	listCmd.Flags().BoolVar(&showExcluded, "show-excluded", false, "除外済みの項目も表示する")
+	listCmd.Flags().BoolVar(&listRunningOnly, "running-only", false, "待機中のワークロードのイメージを除き、動いている Pod のイメージだけを表示する")
+	listCmd.Flags().BoolVar(&listAll, "all", false, "collect 時点でクラスタに残っている未使用の情報 (過去のリリース / Operator の版 / キャッシュ済みイメージ) も表示する (--running-only とは併用不可)")
 	listCmd.Flags().StringVarP(&outputFormat, "output", "o", "", "出力形式 (json, yaml)")
 	listCmd.Flags().StringVar(&authFile, "authfile", "", "レジストリ認証ファイル (default: 自動検出)")
 	listCmd.Flags().IntVar(&concurrency, "concurrency", 50, "サイズ取得の並列数")
